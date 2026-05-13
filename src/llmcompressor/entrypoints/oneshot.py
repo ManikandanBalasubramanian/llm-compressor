@@ -190,6 +190,16 @@ class Oneshot:
             calibration_dataloader=calibration_dataloader,
             recipe_stage=self.recipe_args.stage,
         )
+
+        # For layerwise mode, weights are now on CPU after calibration.
+        # Wrap save_pretrained to enable compressed saving.
+        if getattr(self.model_args, "layerwise", False):
+            from llmcompressor.transformers.compression.compressed_tensors_utils import (
+                modify_save_pretrained,
+            )
+
+            modify_save_pretrained(self.model)
+
         post_process(
             model_args=self.model_args,
             recipe_args=self.recipe_args,
@@ -234,6 +244,13 @@ class Oneshot:
             )
 
             user_pipeline = self.dataset_args.pipeline
+            # Auto-select layerwise pipeline when model is on meta device
+            if (
+                user_pipeline is None
+                and hasattr(self.model, "device")
+                and self.model.device.type == "meta"
+            ):
+                user_pipeline = "layerwise"
             pipeline = CalibrationPipeline.from_modifiers(
                 session.lifecycle.recipe.modifiers, user=user_pipeline
             )
@@ -259,6 +276,7 @@ def oneshot(
     trust_remote_code_model: bool = False,
     save_compressed: bool = True,
     model_revision: str = "main",
+    layerwise: bool = False,
     # Recipe arguments
     recipe: str | list[str] | None = None,
     recipe_args: list[str] | None = None,
@@ -331,6 +349,9 @@ def oneshot(
     :param save_compressed: Whether to compress sparse models during save.
     :param model_revision: The specific model version to use (can be branch name,
         tag, or commit id).
+    :param layerwise: Enable layerwise quantization mode. When True, the model is
+        loaded on meta device and weights are loaded per-subgraph from safetensors
+        during calibration. This allows quantizing models too large for memory.
 
     # Recipe arguments
     :param recipe: Path to a LLM Compressor recipe, or a list of paths
