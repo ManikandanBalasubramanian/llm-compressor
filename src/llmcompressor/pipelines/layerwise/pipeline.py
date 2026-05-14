@@ -5,17 +5,29 @@ This pipeline enables quantization of models that exceed available memory by
 loading weights from safetensors files per-subgraph during calibration, rather
 than loading the entire model at once.
 
+Resource optimizations:
+- Compress-as-you-go: each subgraph is compressed and saved immediately after
+  calibration, so only 1 subgraph of base weights is in memory at a time.
+  Peak CPU RAM = 1 subgraph instead of full model.
+- On-demand shard downloads: only the safetensors shard files needed for the
+  current subgraph are downloaded, not the full model. Disk = ~2 shards at peak.
+- Background prefetch: next subgraph's shard files are downloaded in a background
+  thread while the current subgraph calibrates on GPU.
+
 The pipeline follows the same structure as SequentialPipeline:
 1. Model is traced into subgraphs (using meta-device model structure)
 2. For each subgraph:
-   a. Weights are loaded from safetensors onto GPU
+   a. Weights are loaded from safetensors onto GPU (on-demand download if needed)
    b. Calibration pass triggers modifier hooks (AWQ, GPTQ, etc.)
    c. Quantization/smoothing is applied
    d. Propagation pass captures compressed outputs
-   e. Weights are offloaded back to meta device
+   e. Subgraph is compressed and saved to a shard file
+   f. Weights are offloaded to meta device (freed from memory)
+3. Safetensors index is written to stitch shards together
 """
 
 import contextlib
+import os
 from typing import TYPE_CHECKING, Iterator
 
 import torch
@@ -28,10 +40,13 @@ from llmcompressor.core import LifecycleCallbacks, active_session
 from llmcompressor.modifiers.utils.hooks import HooksMixin
 from llmcompressor.pipelines.cache import IntermediatesCache
 from llmcompressor.pipelines.layerwise.helpers import (
+    ShardPrefetcher,
     build_weight_map,
+    compress_and_save_subgraph,
     get_subgraph_weight_names,
     load_subgraph_weights,
     offload_subgraph_weights,
+    write_safetensors_index,
 )
 from llmcompressor.pipelines.registry import CalibrationPipeline
 from llmcompressor.pipelines.sequential.helpers import (
@@ -86,6 +101,14 @@ class LayerwisePipeline(CalibrationPipeline):
         in memory. This enables quantization of models that are too large to fit
         in GPU or CPU memory.
 
+        Resource optimizations applied:
+        - Compress-as-you-go: each subgraph is compressed and saved to a shard
+          immediately after calibration. Only 1 subgraph in memory at a time.
+        - On-demand shard downloads: only the safetensors shards needed for the
+          current subgraph are downloaded, not the full model.
+        - Background prefetch: the next subgraph's shards are downloaded while
+          the current subgraph calibrates.
+
         Requirements:
         - The model must be on meta device (loaded with layerwise=True)
         - The original model weights must be in safetensors format
@@ -106,7 +129,7 @@ class LayerwisePipeline(CalibrationPipeline):
                 "Ensure the model was loaded with layerwise=True."
             )
 
-        # Build weight map from safetensors index
+        # Build weight map from safetensors index (downloads only index, not shards)
         weight_map = build_weight_map(model_path)
         logger.info(
             f"Built weight map with {len(weight_map)} parameters "
@@ -137,6 +160,19 @@ class LayerwisePipeline(CalibrationPipeline):
         )
         num_subgraphs = len(subgraphs)
         logger.info(f"Traced {num_subgraphs} subgraphs for layerwise calibration")
+
+        # Determine output directory for compress-as-you-go shard saving
+        output_dir = getattr(dataset_args, "output_dir", None)
+        if output_dir is None:
+            # Try to get from the oneshot output_dir via model config
+            output_dir = os.environ.get("LLMCOMPRESSOR_OUTPUT_DIR")
+
+        # Track compressed shards for index writing
+        shard_weight_map: dict[str, str] = {}
+        total_saved_size = 0
+
+        # Initialize shard prefetcher for background downloads
+        prefetcher = ShardPrefetcher(model_path)
 
         LifecycleCallbacks.calibration_epoch_start()
 
@@ -169,14 +205,26 @@ class LayerwisePipeline(CalibrationPipeline):
                     subgraph_index, num_subgraphs,
                 )
 
-                # Load weights for this subgraph from safetensors
+                # Wait for any prefetched shards to be ready
+                prefetcher.wait()
+
+                # Start prefetching next subgraph's shards in background
+                if subgraph_index + 1 < num_subgraphs:
+                    next_weight_names = get_subgraph_weight_names(
+                        model, weight_map, sequential_targets,
+                        subgraph_index + 1, num_subgraphs,
+                    )
+                    prefetcher.prefetch(next_weight_names, weight_map)
+
+                # Load weights for this subgraph (on-demand download if needed)
                 logger.info(
                     f"Loading weights for subgraph "
                     f"{subgraph_index + 1}/{num_subgraphs} "
                     f"({len(weight_names)} parameters)"
                 )
                 load_subgraph_weights(
-                    model, weight_names, weight_map, onload_device
+                    model, weight_names, weight_map, onload_device,
+                    model_path=model_path,
                 )
 
                 # prepare tqdm description texts
@@ -221,31 +269,46 @@ class LayerwisePipeline(CalibrationPipeline):
                                         batch_idx, subgraph.consumed_names
                                     )
 
-                # Offload processed weights to CPU to free GPU memory.
-                # Weights remain on CPU so save_pretrained can compress them later.
-                offload_subgraph_weights(model, weight_names, device="cpu")
-                logger.info(
-                    f"Completed subgraph {subgraph_index + 1}/{num_subgraphs}"
-                )
-
-            # Move any remaining GPU tensors (quantization scales, zero_points,
-            # observer buffers) to CPU for the compression/save phase
-            for name, param in model.named_parameters():
-                if param.device.type == "cuda":
-                    parts = name.rsplit(".", 1)
-                    parent = model
-                    for p in parts[0].split("."):
-                        parent = getattr(parent, p)
-                    parent._parameters[parts[-1]] = torch.nn.Parameter(
-                        param.data.cpu(), requires_grad=param.requires_grad
+                # Compress-as-you-go: compress, save to shard, and free memory
+                if output_dir is not None:
+                    saved_size = compress_and_save_subgraph(
+                        model, weight_names, output_dir,
+                        subgraph_index, shard_weight_map,
                     )
-            for name, buf in model.named_buffers():
-                if buf.device.type == "cuda":
-                    parts = name.rsplit(".", 1)
-                    parent = model
-                    for p in parts[0].split("."):
-                        parent = getattr(parent, p)
-                    parent._buffers[parts[-1]] = buf.cpu()
+                    total_saved_size += saved_size
+                    logger.info(
+                        f"Completed subgraph {subgraph_index + 1}/{num_subgraphs} "
+                        f"(compressed and saved)"
+                    )
+                else:
+                    # Fallback: offload to CPU (legacy behavior)
+                    offload_subgraph_weights(model, weight_names, device="cpu")
+                    logger.info(
+                        f"Completed subgraph {subgraph_index + 1}/{num_subgraphs}"
+                    )
+
+            # Write safetensors index if we saved shards
+            if output_dir is not None and shard_weight_map:
+                write_safetensors_index(output_dir, shard_weight_map, total_saved_size)
+
+            # If we didn't use compress-as-you-go, move remaining GPU tensors to CPU
+            if output_dir is None:
+                for name, param in model.named_parameters():
+                    if param.device.type == "cuda":
+                        parts = name.rsplit(".", 1)
+                        parent = model
+                        for p in parts[0].split("."):
+                            parent = getattr(parent, p)
+                        parent._parameters[parts[-1]] = torch.nn.Parameter(
+                            param.data.cpu(), requires_grad=param.requires_grad
+                        )
+                for name, buf in model.named_buffers():
+                    if buf.device.type == "cuda":
+                        parts = name.rsplit(".", 1)
+                        parent = model
+                        for p in parts[0].split("."):
+                            parent = getattr(parent, p)
+                        parent._buffers[parts[-1]] = buf.cpu()
 
             # Finish any remaining compression
             LifecycleCallbacks.calibration_epoch_end()

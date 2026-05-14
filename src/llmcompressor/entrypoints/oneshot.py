@@ -186,25 +186,78 @@ class Oneshot:
         calibration_dataloader = get_calibration_dataloader(
             self.dataset_args, self.processor
         )
+
+        # For layerwise compress-as-you-go: pass output_dir to the pipeline
+        # so it can save compressed shards incrementally
+        if getattr(self.model_args, "layerwise", False) and self.output_dir:
+            import os
+            os.environ["LLMCOMPRESSOR_OUTPUT_DIR"] = self.output_dir
+
         self.apply_recipe_modifiers(
             calibration_dataloader=calibration_dataloader,
             recipe_stage=self.recipe_args.stage,
         )
 
-        # For layerwise mode, weights are now on CPU after calibration.
-        # Wrap save_pretrained to enable compressed saving.
-        if getattr(self.model_args, "layerwise", False):
+        # Check if compress-as-you-go already saved the shards
+        layerwise_saved = getattr(self.model_args, "layerwise", False) and (
+            self.output_dir
+            and os.path.exists(
+                os.path.join(self.output_dir, "model.safetensors.index.json")
+            )
+        )
+
+        if layerwise_saved:
+            # Shards already compressed and saved by the pipeline.
+            # Just save config, tokenizer, and recipe.
+            import os
+            from compressed_tensors import ModelCompressor
             from llmcompressor.transformers.compression.compressed_tensors_utils import (
-                modify_save_pretrained,
+                update_and_save_recipe,
+            )
+            from llmcompressor.pytorch.model_load.helpers import (
+                copy_python_files_from_model_cache,
             )
 
-            modify_save_pretrained(self.model)
+            output_dir = self.output_dir
+            if (
+                self.recipe_args is not None
+                and getattr(self.recipe_args, "stage", None) is not None
+            ):
+                output_dir = os.path.join(output_dir, self.recipe_args.stage)
 
-        post_process(
-            model_args=self.model_args,
-            recipe_args=self.recipe_args,
-            output_dir=self.output_dir,
-        )
+            # Save model config with quantization metadata
+            self.model.config.save_pretrained(output_dir)
+
+            # Update config with compression info
+            compressor = ModelCompressor.from_pretrained_model(self.model)
+            compressor.update_config(output_dir)
+
+            # Save tokenizer/processor
+            if self.model_args.processor is not None:
+                self.model_args.processor.save_pretrained(output_dir)
+
+            # Save recipe
+            update_and_save_recipe(self.model.name_or_path, output_dir)
+            copy_python_files_from_model_cache(self.model, output_dir)
+
+            logger.info(f"Layerwise compress-as-you-go: saved to {output_dir}")
+        else:
+            # Legacy path: wrap save_pretrained for compressed saving
+            if getattr(self.model_args, "layerwise", False):
+                from llmcompressor.transformers.compression.compressed_tensors_utils import (
+                    modify_save_pretrained,
+                )
+                modify_save_pretrained(self.model)
+
+            post_process(
+                model_args=self.model_args,
+                recipe_args=self.recipe_args,
+                output_dir=self.output_dir,
+            )
+
+        # Clean up env var
+        if "LLMCOMPRESSOR_OUTPUT_DIR" in os.environ:
+            del os.environ["LLMCOMPRESSOR_OUTPUT_DIR"]
 
     def apply_recipe_modifiers(
         self,
