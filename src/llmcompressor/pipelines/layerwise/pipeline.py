@@ -167,8 +167,8 @@ class LayerwisePipeline(CalibrationPipeline):
 
         # Auto-detect key remapping for VL/multimodal models
         # (e.g., safetensors uses "model.language_model.*" but CausalLM uses "model.*")
-        weight_map, model_to_safetensors, passthrough_keys = build_key_remapping(
-            raw_weight_map, model
+        weight_map, model_to_safetensors, passthrough_keys, tied_weights = (
+            build_key_remapping(raw_weight_map, model)
         )
 
         # prepare model for sequential onloading
@@ -195,6 +195,41 @@ class LayerwisePipeline(CalibrationPipeline):
         )
         num_subgraphs = len(subgraphs)
         logger.info(f"Traced {num_subgraphs} subgraphs for layerwise calibration")
+
+        # Compute which weight_map keys are assigned to subgraphs.
+        # Keys NOT assigned to any subgraph (e.g., MTP extra layers) must
+        # be saved via passthrough. Keys that ARE assigned (e.g., individual
+        # MoE expert keys that get fused during loading) should NOT be in
+        # passthrough to avoid redundant copies.
+        assigned_keys: set[str] = set()
+        for si in range(num_subgraphs):
+            assigned_keys.update(get_subgraph_weight_names(
+                model, weight_map, sequential_targets, si, num_subgraphs,
+            ))
+
+        # Filter passthrough: keep original passthrough keys (VL visual/mtp)
+        # that aren't assigned. Also add weight_map keys not assigned to any
+        # subgraph (e.g., GLM layer 47 MTP stored as model.layers.47.*).
+        original_passthrough = set(passthrough_keys)
+        unassigned_wm_keys = set(weight_map.keys()) - assigned_keys
+        passthrough_keys = sorted(
+            (original_passthrough | unassigned_wm_keys) - assigned_keys
+        )
+        # For passthrough copy, we need raw safetensors keys, not model keys.
+        # Convert any remapped keys back to their safetensors names.
+        raw_passthrough_keys = []
+        for k in passthrough_keys:
+            if k in model_to_safetensors:
+                raw_passthrough_keys.append(model_to_safetensors[k])
+            elif k in raw_weight_map:
+                raw_passthrough_keys.append(k)
+            # else: skip (shouldn't happen)
+
+        if passthrough_keys:
+            logger.info(
+                f"Passthrough keys after filtering: {len(raw_passthrough_keys)} "
+                f"(was {len(original_passthrough)} before)"
+            )
 
         # Check for resume mode (skip already-completed subgraphs)
         resume_from = int(os.environ.get("LAYERWISE_RESUME_FROM", "0"))
@@ -263,6 +298,7 @@ class LayerwisePipeline(CalibrationPipeline):
                         model, weight_names, weight_map, onload_device,
                         model_path=model_path,
                         model_to_safetensors=model_to_safetensors,
+                        tied_weights=tied_weights,
                     )
                     move_subgraph_buffers(
                         model, subgraph.submodules(model, recurse=True),
@@ -315,6 +351,7 @@ class LayerwisePipeline(CalibrationPipeline):
                     model, weight_names, weight_map, onload_device,
                     model_path=model_path,
                     model_to_safetensors=model_to_safetensors,
+                    tied_weights=tied_weights,
                 )
                 move_subgraph_buffers(
                     model, subgraph.submodules(model, recurse=True),
@@ -385,9 +422,9 @@ class LayerwisePipeline(CalibrationPipeline):
             # Write safetensors index if we saved shards
             if output_dir is not None:
                 # Copy passthrough weights (visual encoder, mtp, etc.)
-                if passthrough_keys:
+                if raw_passthrough_keys:
                     pt_size = copy_passthrough_weights(
-                        passthrough_keys, raw_weight_map,
+                        raw_passthrough_keys, raw_weight_map,
                         output_dir, shard_weight_map,
                         model_path=model_path,
                     )

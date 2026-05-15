@@ -37,10 +37,94 @@ __all__ = [
 ]
 
 
+def _all_named_parameters(model: Module):
+    """
+    Yield (name, param) for ALL parameters including tied duplicates.
+
+    Unlike ``model.named_parameters()`` which deduplicates by ``id(param)``,
+    this yields every parameter path. This is needed to detect tied weights
+    like ``lm_head.weight`` tied to ``model.embed_tokens.weight``.
+    """
+    for module_name, module in model.named_modules():
+        for param_name, param in module._parameters.items():
+            if param is not None:
+                full_name = (
+                    f"{module_name}.{param_name}" if module_name else param_name
+                )
+                yield full_name, param
+
+
+def _detect_tied_weights(
+    model: Module, weight_map: dict[str, str]
+) -> dict[str, str]:
+    """
+    Detect model parameters that are tied to other parameters but missing
+    from the weight map. Returns ``{tied_name: source_name}`` where
+    ``source_name`` is the key in ``weight_map`` that holds the data.
+
+    Uses two detection methods:
+    1. On meta device with tie_weights() called: tied params share same ``id()``.
+    2. Fallback: check model config's ``tie_word_embeddings`` flag for the
+       common lm_head <-> embed_tokens tying pattern (since ``from_config()``
+       with ``init_empty_weights()`` may not actually share tensor objects).
+    """
+    # Ensure tie_weights() is called so tied params share the same id
+    if hasattr(model, "tie_weights"):
+        model.tie_weights()
+
+    # Map tensor id -> first param name found in weight_map
+    id_to_source: dict[int, str] = {}
+    all_params: dict[str, torch.nn.Parameter] = {}
+
+    for name, param in _all_named_parameters(model):
+        all_params[name] = param
+        tid = id(param)
+        if name in weight_map and tid not in id_to_source:
+            id_to_source[tid] = name
+
+    tied: dict[str, str] = {}
+    for name, param in all_params.items():
+        if name not in weight_map:
+            source = id_to_source.get(id(param))
+            if source:
+                tied[name] = source
+
+    # Fallback: if id-based detection didn't find anything, check config
+    # for the common tie_word_embeddings pattern
+    if not tied:
+        config = getattr(model, "config", None)
+        if config and getattr(config, "tie_word_embeddings", False):
+            # Common pattern: lm_head.weight is tied to embed_tokens.weight
+            # Find the embed_tokens weight in weight_map
+            embed_key = None
+            lm_head_key = None
+            for key in weight_map:
+                if "embed_tokens.weight" in key:
+                    embed_key = key
+                if key.endswith("lm_head.weight") or key == "lm_head.weight":
+                    lm_head_key = key
+
+            # Also find lm_head.weight in model params (even if not in wm)
+            lm_head_param = None
+            for name in all_params:
+                if name.endswith("lm_head.weight") or name == "lm_head.weight":
+                    lm_head_param = name
+
+            if embed_key and lm_head_param and lm_head_param not in weight_map:
+                tied[lm_head_param] = embed_key
+
+    if tied:
+        logger.info(
+            f"Detected {len(tied)} tied weight(s): "
+            + ", ".join(f"{t} -> {s}" for t, s in tied.items())
+        )
+    return tied
+
+
 def build_key_remapping(
     weight_map: dict[str, str],
     model: Module,
-) -> tuple[dict[str, str], dict[str, str], list[str]]:
+) -> tuple[dict[str, str], dict[str, str], list[str], dict[str, str]]:
     """
     Auto-detect and build a bidirectional key remapping between safetensors
     weight names and model parameter names.
@@ -50,6 +134,9 @@ def build_key_remapping(
       - Safetensors: ``model.language_model.layers.0.*``
       - CausalLM:    ``model.layers.0.*``
 
+    Also detects tied weights (e.g., ``lm_head.weight`` tied to
+    ``model.embed_tokens.weight``) and adds them to the weight map.
+
     :param weight_map: raw mapping from safetensors weight name to file path
     :param model: the model (on meta device)
     :return: tuple of:
@@ -58,8 +145,11 @@ def build_key_remapping(
           safetensors key (for saving with original naming)
         - passthrough_keys: safetensors keys that don't map to any model param
           (e.g., visual encoder, mtp weights) — to be copied as-is to output
+        - tied_weights: mapping from tied param name to source param name
+          (for loading tied weights from the source key in safetensors)
     """
-    model_params = set(name for name, _ in model.named_parameters())
+    # Use _all_named_parameters to avoid dedup (finds tied weights)
+    model_params = set(name for name, _ in _all_named_parameters(model))
     safetensors_keys = set(weight_map.keys())
 
     # Fast path: if keys already match substantially, no remapping needed.
@@ -75,7 +165,14 @@ def build_key_remapping(
                 f"Key remapping: {len(passthrough)} passthrough weights "
                 f"(not in model, will be copied as-is)"
             )
-        return dict(weight_map), {}, passthrough
+        result_wm = dict(weight_map)
+        # Detect tied weights (e.g., lm_head.weight tied to embed_tokens.weight)
+        # Add to weight_map so subgraph assignment works, but keep separate
+        # from model_to_safetensors so saving uses the model key (not source).
+        tied = _detect_tied_weights(model, result_wm)
+        for tied_name, source_name in tied.items():
+            result_wm[tied_name] = result_wm[source_name]
+        return result_wm, {}, passthrough, tied
 
     if overlap:
         logger.info(
@@ -193,7 +290,14 @@ def build_key_remapping(
     if passthrough_keys[:3]:
         logger.debug(f"  Sample passthrough: {passthrough_keys[:3]}")
 
-    return remapped_weight_map, model_to_safetensors, passthrough_keys
+    # Detect tied weights in the slow path too
+    tied = _detect_tied_weights(model, remapped_weight_map)
+    for tied_name, source_name in tied.items():
+        remapped_weight_map[tied_name] = remapped_weight_map[source_name]
+        # Don't add to model_to_safetensors — that's used for save remapping.
+        # Tied weights should save under their model key, not the source key.
+
+    return remapped_weight_map, model_to_safetensors, passthrough_keys, tied
 
 
 def copy_passthrough_weights(
@@ -447,6 +551,7 @@ def load_subgraph_weights(
     device: torch.device,
     model_path: str | None = None,
     model_to_safetensors: dict[str, str] | None = None,
+    tied_weights: dict[str, str] | None = None,
 ) -> None:
     """
     Load weights from safetensors files for the given weight names,
@@ -463,6 +568,9 @@ def load_subgraph_weights(
     :param model_path: HF Hub model ID for on-demand shard downloads
     :param model_to_safetensors: optional mapping from model param name to
         the original safetensors key (for VL models where keys differ)
+    :param tied_weights: optional mapping from tied param name to source param
+        name (e.g., lm_head.weight -> model.embed_tokens.weight). Used to
+        resolve the safetensors key for tied weights.
     """
     if not weight_names:
         return
@@ -495,6 +603,14 @@ def load_subgraph_weights(
                     if model_to_safetensors
                     else param_name
                 )
+                # For tied weights, load from the source param's key
+                if tied_weights and param_name in tied_weights:
+                    source = tied_weights[param_name]
+                    sf_key = (
+                        model_to_safetensors.get(source, source)
+                        if model_to_safetensors
+                        else source
+                    )
                 tensor = f.get_tensor(sf_key)
                 # Try normal set; fall back to fused MoE splitting
                 if not _try_set_fused_moe(model, param_name, tensor):
