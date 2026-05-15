@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING, Iterator
 import torch
 from compressed_tensors.offload import disable_offloading
 from loguru import logger
+from safetensors import safe_open
 from torch.utils.data.dataloader import DataLoader
 from tqdm import tqdm
 
@@ -41,10 +42,13 @@ from llmcompressor.modifiers.utils.hooks import HooksMixin
 from llmcompressor.pipelines.cache import IntermediatesCache
 from llmcompressor.pipelines.layerwise.helpers import (
     ShardPrefetcher,
+    build_key_remapping,
     build_weight_map,
     compress_and_save_subgraph,
+    copy_passthrough_weights,
     get_subgraph_weight_names,
     load_subgraph_weights,
+    move_subgraph_buffers,
     offload_subgraph_weights,
     write_safetensors_index,
 )
@@ -61,6 +65,31 @@ if TYPE_CHECKING:
     from llmcompressor.args.dataset_arguments import DatasetArguments
 
 __all__ = ["LayerwisePipeline"]
+
+
+def _save_original_config(
+    model_path: str, output_dir: str | os.PathLike
+) -> None:
+    """
+    Save the original model config from model_path to output_dir.
+
+    For VL/multimodal models, the CausalLM model's config is the text-only
+    config. This function copies the original ConditionalGeneration config
+    so the quantized output can be loaded as the full VL model at inference.
+    """
+    from transformers import AutoConfig
+
+    try:
+        original_config = AutoConfig.from_pretrained(
+            model_path, trust_remote_code=True
+        )
+        original_config.save_pretrained(output_dir)
+        logger.info(
+            f"Saved original VL config ({original_config.architectures}) "
+            f"to {output_dir}"
+        )
+    except Exception as e:
+        logger.warning(f"Could not save original VL config: {e}")
 
 
 def _get_batches(
@@ -130,10 +159,16 @@ class LayerwisePipeline(CalibrationPipeline):
             )
 
         # Build weight map from safetensors index (downloads only index, not shards)
-        weight_map = build_weight_map(model_path)
+        raw_weight_map = build_weight_map(model_path)
         logger.info(
-            f"Built weight map with {len(weight_map)} parameters "
+            f"Built weight map with {len(raw_weight_map)} parameters "
             f"from {model_path}"
+        )
+
+        # Auto-detect key remapping for VL/multimodal models
+        # (e.g., safetensors uses "model.language_model.*" but CausalLM uses "model.*")
+        weight_map, model_to_safetensors, passthrough_keys = build_key_remapping(
+            raw_weight_map, model
         )
 
         # prepare model for sequential onloading
@@ -160,6 +195,15 @@ class LayerwisePipeline(CalibrationPipeline):
         )
         num_subgraphs = len(subgraphs)
         logger.info(f"Traced {num_subgraphs} subgraphs for layerwise calibration")
+
+        # Check for resume mode (skip already-completed subgraphs)
+        resume_from = int(os.environ.get("LAYERWISE_RESUME_FROM", "0"))
+        if resume_from > 0:
+            logger.info(
+                f"Resuming from subgraph {resume_from + 1}/{num_subgraphs} "
+                f"(replaying forward passes through {resume_from} completed "
+                f"subgraphs to rebuild intermediates)"
+            )
 
         # Determine output directory for compress-as-you-go shard saving
         output_dir = getattr(dataset_args, "output_dir", None)
@@ -205,6 +249,51 @@ class LayerwisePipeline(CalibrationPipeline):
                     subgraph_index, num_subgraphs,
                 )
 
+                # Resume mode: replay forward pass to rebuild intermediates
+                if subgraph_index < resume_from:
+                    prefetcher.wait()
+                    if subgraph_index + 1 < num_subgraphs:
+                        next_wn = get_subgraph_weight_names(
+                            model, weight_map, sequential_targets,
+                            subgraph_index + 1, num_subgraphs,
+                        )
+                        prefetcher.prefetch(next_wn, weight_map)
+
+                    load_subgraph_weights(
+                        model, weight_names, weight_map, onload_device,
+                        model_path=model_path,
+                        model_to_safetensors=model_to_safetensors,
+                    )
+                    move_subgraph_buffers(
+                        model, subgraph.submodules(model, recurse=True),
+                        onload_device,
+                    )
+
+                    replay_desc = (
+                        f"({subgraph_index + 1}/{num_subgraphs}): Replaying"
+                    )
+                    num_batches = len(dataloader)
+                    with disable_offloading():
+                        with HooksMixin.disable_hooks():
+                            for batch_idx, inputs in _get_batches(
+                                activations, num_batches,
+                                subgraph.input_names, replay_desc,
+                                sequential_prefetch,
+                            ):
+                                output = subgraph.forward(model, **inputs)
+                                if subgraph_index < num_subgraphs - 1:
+                                    activations.update(batch_idx, output)
+                                    activations.delete(
+                                        batch_idx, subgraph.consumed_names
+                                    )
+
+                    offload_subgraph_weights(model, weight_names, device="meta")
+                    logger.info(
+                        f"Replayed subgraph "
+                        f"{subgraph_index + 1}/{num_subgraphs} (skipped)"
+                    )
+                    continue
+
                 # Wait for any prefetched shards to be ready
                 prefetcher.wait()
 
@@ -225,6 +314,11 @@ class LayerwisePipeline(CalibrationPipeline):
                 load_subgraph_weights(
                     model, weight_names, weight_map, onload_device,
                     model_path=model_path,
+                    model_to_safetensors=model_to_safetensors,
+                )
+                move_subgraph_buffers(
+                    model, subgraph.submodules(model, recurse=True),
+                    onload_device,
                 )
 
                 # prepare tqdm description texts
@@ -274,6 +368,7 @@ class LayerwisePipeline(CalibrationPipeline):
                     saved_size = compress_and_save_subgraph(
                         model, weight_names, output_dir,
                         subgraph_index, shard_weight_map,
+                        model_to_safetensors=model_to_safetensors,
                     )
                     total_saved_size += saved_size
                     logger.info(
@@ -288,8 +383,43 @@ class LayerwisePipeline(CalibrationPipeline):
                     )
 
             # Write safetensors index if we saved shards
-            if output_dir is not None and shard_weight_map:
-                write_safetensors_index(output_dir, shard_weight_map, total_saved_size)
+            if output_dir is not None:
+                # Copy passthrough weights (visual encoder, mtp, etc.)
+                if passthrough_keys:
+                    pt_size = copy_passthrough_weights(
+                        passthrough_keys, raw_weight_map,
+                        output_dir, shard_weight_map,
+                        model_path=model_path,
+                    )
+                    total_saved_size += pt_size
+
+                if resume_from > 0:
+                    # Resume mode: scan all shard files (old + new) to build
+                    # a complete weight map for the index
+                    from pathlib import Path as _Path
+
+                    complete_weight_map: dict[str, str] = {}
+                    complete_total_size = 0
+                    for shard_path in sorted(
+                        _Path(output_dir).glob("model-*-of-*.safetensors")
+                    ):
+                        complete_total_size += shard_path.stat().st_size
+                        with safe_open(str(shard_path), framework="pt") as f:
+                            for key in f.keys():
+                                complete_weight_map[key] = shard_path.name
+                    if complete_weight_map:
+                        write_safetensors_index(
+                            output_dir, complete_weight_map, complete_total_size
+                        )
+                elif shard_weight_map:
+                    write_safetensors_index(
+                        output_dir, shard_weight_map, total_saved_size
+                    )
+
+                # For VL models: save the original config so the output loads
+                # as the full VL model (ConditionalGeneration) at inference
+                if passthrough_keys and model_path:
+                    _save_original_config(model_path, output_dir)
 
             # If we didn't use compress-as-you-go, move remaining GPU tensors to CPU
             if output_dir is None:

@@ -170,6 +170,24 @@ _deepseek_mappings = [
     AWQMapping("re:.*up_proj$", ["re:.*down_proj$"]),
 ]
 
+# Glm4MoeLite (GLM-4.7-Flash) — MLA attention like DeepSeek, but
+# first_k_dense_replace=1 means layer 0 is a plain MLP with no router.
+# The router (mlp.gate) is excluded from post_attention_layernorm balance
+# so the mapping resolves uniformly across both dense and MoE layers.
+_glm4_moe_lite_mappings = [
+    AWQMapping(
+        "re:.*input_layernorm$",
+        ["re:.*q_a_proj$", "re:.*kv_a_proj_with_mqa$"],
+    ),
+    AWQMapping("re:.*q_a_layernorm$", ["re:.*q_b_proj$"]),
+    AWQMapping("re:.*kv_a_layernorm$", ["re:.*kv_b_proj$"]),
+    AWQMapping(
+        "re:.*post_attention_layernorm$",
+        ["re:.*gate_proj$", "re:.*up_proj$"],
+    ),
+    AWQMapping("re:.*up_proj$", ["re:.*down_proj$"]),
+]
+
 _bloom_mappings = [
     AWQMapping("re:.*input_layernorm$", ["re:.*query_key_value$"]),
     AWQMapping("re:.*post_attention_layernorm$", ["re:.*dense_h_to_4h$"]),
@@ -251,6 +269,7 @@ AWQ_MAPPING_REGISTRY: dict[str, list[AWQMapping]] = {
     "Gemma3ForCausalLM": _gemma_mappings,
     "Gemma3ForConditionalGeneration": _gemma_mappings,
     "Glm4MoeForCausalLM": _moe_default_mappings,
+    "Glm4MoeLiteForCausalLM": _glm4_moe_lite_mappings,
     "GlmMoeDsaForCausalLM": _deepseek_mappings,
     "LlamaForCausalLM": default_mappings,
     "Llama4ForConditionalGeneration": _llama4_default_mappings,
@@ -264,6 +283,7 @@ AWQ_MAPPING_REGISTRY: dict[str, list[AWQMapping]] = {
     "Qwen2MoeForCausalLM": _moe_default_mappings,
     "Qwen3ForCausalLM": default_mappings,
     "Qwen3MoeForCausalLM": _moe_default_mappings,
+    "Qwen3_5MoeForCausalLM": _moe_default_mappings,
     "SeedOssForCausalLM": default_mappings,
     "Ernie4_5_MoeForCausalLM": default_mappings,
 }

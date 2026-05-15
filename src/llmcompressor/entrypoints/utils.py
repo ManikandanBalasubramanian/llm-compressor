@@ -199,6 +199,7 @@ def initialize_model_from_path(
         with init_empty_weights():
             model = AutoModelForCausalLM.from_config(
                 config,
+                dtype=dtype,
                 torch_dtype=dtype,
                 trust_remote_code=model_kwargs.get("trust_remote_code", False),
             )

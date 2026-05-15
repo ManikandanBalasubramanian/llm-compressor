@@ -89,7 +89,15 @@ class CalibrationOffsetNorm(NormCalibrationModule):
         return output.type_as(x)
 
     def restore(self, original: torch.nn.Module) -> torch.nn.Module:
-        original.weight.data = (self.weight.data.float() - 1.0).to(self._orig_dtype)
+        restored_weight = (self.weight.data.float() - 1.0).to(self._orig_dtype)
+        if original.weight.device.type == "meta":
+            # In layerwise mode, original may still be on meta device.
+            # Replace the parameter entirely instead of using .data assignment.
+            original.weight = torch.nn.Parameter(
+                restored_weight, requires_grad=original.weight.requires_grad
+            )
+        else:
+            original.weight.data = restored_weight
         return original
 
 

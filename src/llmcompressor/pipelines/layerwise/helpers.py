@@ -25,13 +25,235 @@ from torch.nn import Module
 
 __all__ = [
     "build_weight_map",
+    "build_key_remapping",
     "get_subgraph_weight_names",
     "load_subgraph_weights",
+    "move_subgraph_buffers",
     "offload_subgraph_weights",
     "compress_and_save_subgraph",
+    "copy_passthrough_weights",
     "write_safetensors_index",
     "ShardPrefetcher",
 ]
+
+
+def build_key_remapping(
+    weight_map: dict[str, str],
+    model: Module,
+) -> tuple[dict[str, str], dict[str, str], list[str]]:
+    """
+    Auto-detect and build a bidirectional key remapping between safetensors
+    weight names and model parameter names.
+
+    This handles VL/multimodal models where safetensors keys use a different
+    prefix than the CausalLM model. For example:
+      - Safetensors: ``model.language_model.layers.0.*``
+      - CausalLM:    ``model.layers.0.*``
+
+    :param weight_map: raw mapping from safetensors weight name to file path
+    :param model: the model (on meta device)
+    :return: tuple of:
+        - remapped_weight_map: weight_map with keys changed to model param names
+        - model_to_safetensors: mapping from model param name back to original
+          safetensors key (for saving with original naming)
+        - passthrough_keys: safetensors keys that don't map to any model param
+          (e.g., visual encoder, mtp weights) — to be copied as-is to output
+    """
+    model_params = set(name for name, _ in model.named_parameters())
+    safetensors_keys = set(weight_map.keys())
+
+    # Fast path: if keys already match substantially, no remapping needed.
+    # Require >50% of model params to be in safetensors keys to avoid
+    # false positives (e.g., MTP keys overlap but main model keys don't).
+    overlap = model_params & safetensors_keys
+    overlap_ratio = len(overlap) / len(model_params) if model_params else 0
+    if overlap_ratio > 0.5:
+        # Keys match directly — passthrough is anything not in model
+        passthrough = sorted(safetensors_keys - model_params)
+        if passthrough:
+            logger.info(
+                f"Key remapping: {len(passthrough)} passthrough weights "
+                f"(not in model, will be copied as-is)"
+            )
+        return dict(weight_map), {}, passthrough
+
+    if overlap:
+        logger.info(
+            f"Key remapping: partial overlap ({len(overlap)}/{len(model_params)} "
+            f"= {overlap_ratio:.1%} of model params). Attempting prefix remapping."
+        )
+
+    # No/low overlap — try to detect a common prefix mismatch.
+    # Strategy: pick a model param NOT in the direct overlap and find the
+    # safetensors key that shares the same suffix but with a different prefix.
+    # Example: model has "model.layers.0.self_attn.q_proj.weight"
+    #          safetensors has "model.language_model.layers.0.self_attn.q_proj.weight"
+    #          => prefix_to_strip = "model.language_model."
+    #          => prefix_to_add   = "model."
+    prefix_to_strip = None
+    prefix_to_add = None
+
+    # Skip params that already match directly (e.g., lm_head.weight) —
+    # they would yield empty prefixes and mask the real mismatch.
+    mismatched_params = sorted(model_params - overlap)
+
+    for model_param in mismatched_params:
+        # Find a safetensors key that ends with a suffix matching this param
+        # after stripping the common model prefix
+        for sf_key in safetensors_keys:
+            if sf_key == model_param:
+                continue  # exact match, not useful for prefix detection
+            if sf_key.endswith(model_param):
+                # e.g., sf_key = "model.language_model.layers.0.weight"
+                #        model_param = "model.layers.0.weight"
+                # => prefix_to_strip = "model.language_model."
+                # => prefix_to_add   = "model."
+                # But this is the degenerate case; more robust:
+                prefix_to_strip = sf_key[: len(sf_key) - len(model_param)]
+                prefix_to_add = ""
+                break
+            # Try matching by the portion after the first dot segment
+            # e.g., model="model.layers.0.weight" vs sf="model.language_model.layers.0.weight"
+            # Find common suffix
+            mp_parts = model_param.split(".")
+            sf_parts = sf_key.split(".")
+            # Align from the end
+            common_suffix_len = 0
+            for i in range(1, min(len(mp_parts), len(sf_parts)) + 1):
+                if mp_parts[-i] == sf_parts[-i]:
+                    common_suffix_len = i
+                else:
+                    break
+            if common_suffix_len >= 3:  # need at least module.param_type.weight
+                sf_prefix = ".".join(sf_parts[: len(sf_parts) - common_suffix_len])
+                mp_prefix = ".".join(mp_parts[: len(mp_parts) - common_suffix_len])
+                prefix_to_strip = sf_prefix + "." if sf_prefix else ""
+                prefix_to_add = mp_prefix + "." if mp_prefix else ""
+                break
+        if prefix_to_strip is not None:
+            break
+
+    if prefix_to_strip is None:
+        logger.warning(
+            "Key remapping: could not detect prefix mismatch between "
+            "safetensors keys and model parameters. Proceeding without remapping."
+        )
+        return dict(weight_map), {}, sorted(safetensors_keys)
+
+    logger.info(
+        f"Key remapping: detected prefix mismatch\n"
+        f"  safetensors prefix: '{prefix_to_strip}'\n"
+        f"  model prefix:       '{prefix_to_add}'\n"
+        f"  Remapping {len(safetensors_keys)} safetensors keys"
+    )
+
+    remapped_weight_map: dict[str, str] = {}
+    model_to_safetensors: dict[str, str] = {}
+    passthrough_keys: list[str] = []
+
+    # Build set of named module paths for detecting fused weights.
+    # E.g., fused MoE expert tensors (gate_up_proj, down_proj) have parent
+    # modules that exist in the model but the fused weight itself is not a
+    # regular nn.Parameter (it gets unfused during calibration).
+    model_modules = set(name for name, _ in model.named_modules())
+
+    for sf_key, file_path in weight_map.items():
+        if sf_key.startswith(prefix_to_strip):
+            model_key = prefix_to_add + sf_key[len(prefix_to_strip):]
+            if model_key in model_params:
+                remapped_weight_map[model_key] = file_path
+                model_to_safetensors[model_key] = sf_key
+            elif (
+                "." in model_key
+                and model_key.rsplit(".", 1)[0] in model_modules
+            ):
+                # Fused weight: parent module exists but this specific weight
+                # is not a regular parameter (e.g., fused MoE expert tensors).
+                # Keep in remapped map so subgraph assignment works.
+                remapped_weight_map[model_key] = file_path
+                model_to_safetensors[model_key] = sf_key
+            else:
+                passthrough_keys.append(sf_key)
+        elif sf_key in model_params:
+            # Direct match (e.g., MTP keys that already use the model's naming)
+            remapped_weight_map[sf_key] = file_path
+        else:
+            passthrough_keys.append(sf_key)
+
+    # Count fused vs param matches
+    fused_count = sum(
+        1 for k in remapped_weight_map if k not in model_params
+    )
+    matched = len(remapped_weight_map)
+    logger.info(
+        f"Key remapping: {matched} matched ({matched - fused_count} params, "
+        f"{fused_count} fused), "
+        f"{len(passthrough_keys)} passthrough (visual/mtp/etc)"
+    )
+    if passthrough_keys[:3]:
+        logger.debug(f"  Sample passthrough: {passthrough_keys[:3]}")
+
+    return remapped_weight_map, model_to_safetensors, passthrough_keys
+
+
+def copy_passthrough_weights(
+    passthrough_keys: list[str],
+    weight_map: dict[str, str],
+    output_dir: str | os.PathLike,
+    shard_weight_map: dict[str, str],
+    model_path: str | None = None,
+) -> int:
+    """
+    Copy passthrough weights (e.g., visual encoder, mtp) from source
+    safetensors directly to the output directory without modification.
+
+    These are weights present in the original model safetensors that are not
+    part of the CausalLM model (e.g., vision encoder for VL models).
+
+    :param passthrough_keys: list of safetensors key names to copy
+    :param weight_map: raw (un-remapped) weight_map from build_weight_map()
+    :param output_dir: directory to save the passthrough shard
+    :param shard_weight_map: dict to update with weight_name -> shard_file
+    :param model_path: HF Hub model ID for on-demand downloads
+    :return: total size in bytes of copied tensors
+    """
+    if not passthrough_keys:
+        return 0
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Group by source shard file
+    file_to_keys: dict[str, list[str]] = {}
+    for key in passthrough_keys:
+        if key in weight_map:
+            file_path = weight_map[key]
+            file_to_keys.setdefault(file_path, []).append(key)
+
+    # Load and save passthrough tensors
+    tensors: dict[str, torch.Tensor] = {}
+    for file_path, keys in file_to_keys.items():
+        resolved_path = _ensure_shard_available(file_path, model_path)
+        with safe_open(resolved_path, framework="pt", device="cpu") as f:
+            for key in keys:
+                tensors[key] = f.get_tensor(key)
+
+    if not tensors:
+        return 0
+
+    shard_name = "model-passthrough-of-99999.safetensors"
+    shard_path = output_dir / shard_name
+    save_file(tensors, str(shard_path))
+
+    total_size = sum(t.nbytes for t in tensors.values())
+    for key in tensors:
+        shard_weight_map[key] = shard_name
+
+    logger.info(
+        f"Copied {len(tensors)} passthrough weights "
+        f"({total_size / 1e9:.2f} GB) -> {shard_name}"
+    )
+    return total_size
 
 
 def build_weight_map(model_path: str | os.PathLike) -> dict[str, str]:
@@ -224,6 +446,7 @@ def load_subgraph_weights(
     weight_map: dict[str, str],
     device: torch.device,
     model_path: str | None = None,
+    model_to_safetensors: dict[str, str] | None = None,
 ) -> None:
     """
     Load weights from safetensors files for the given weight names,
@@ -233,10 +456,13 @@ def load_subgraph_weights(
     from the HF Hub using model_path as the repo ID.
 
     :param model: the full model (meta device)
-    :param weight_names: list of parameter names to load
-    :param weight_map: mapping from weight name to safetensors file path
+    :param weight_names: list of parameter names (model param names) to load
+    :param weight_map: mapping from model param name to safetensors file path
+        (after remapping by build_key_remapping)
     :param device: device to load weights onto
     :param model_path: HF Hub model ID for on-demand shard downloads
+    :param model_to_safetensors: optional mapping from model param name to
+        the original safetensors key (for VL models where keys differ)
     """
     if not weight_names:
         return
@@ -263,8 +489,16 @@ def load_subgraph_weights(
         resolved_path = _ensure_shard_available(file_path, model_path)
         with safe_open(resolved_path, framework="pt", device=str(device)) as f:
             for param_name in params:
-                tensor = f.get_tensor(param_name)
-                _set_parameter(model, param_name, tensor)
+                # Use original safetensors key if remapping exists
+                sf_key = (
+                    model_to_safetensors.get(param_name, param_name)
+                    if model_to_safetensors
+                    else param_name
+                )
+                tensor = f.get_tensor(sf_key)
+                # Try normal set; fall back to fused MoE splitting
+                if not _try_set_fused_moe(model, param_name, tensor):
+                    _set_parameter(model, param_name, tensor)
                 loaded_count += 1
 
     logger.debug(f"Loaded {loaded_count} parameters for subgraph onto {device}")
@@ -272,6 +506,34 @@ def load_subgraph_weights(
     # Also move any quantization buffers (observers, scales, zero_points)
     # that were initialized on meta device to the target device
     _move_quantization_buffers(model, weight_names, device)
+
+
+def move_subgraph_buffers(
+    model: Module,
+    subgraph_modules: set,
+    device: torch.device,
+) -> None:
+    """
+    Move all buffers in a subgraph's modules from meta/CPU to the target device.
+
+    This is needed because some modules (e.g., RoPE rotary_emb) have buffers
+    like ``inv_freq`` that are not stored in safetensors and thus don't get
+    loaded by :func:`load_subgraph_weights`. In layerwise mode these buffers
+    stay on their init device (meta or CPU), causing device mismatches during
+    the forward pass.
+
+    :param model: the model (not used directly, but kept for API consistency)
+    :param subgraph_modules: set of modules from ``subgraph.submodules(model, recurse=True)``
+    :param device: target device to move buffers to
+    """
+    moved = 0
+    for module in subgraph_modules:
+        for attr_name, buf in list(module._buffers.items()):
+            if buf is not None and buf.device != device:
+                module._buffers[attr_name] = buf.to(device)
+                moved += 1
+    if moved:
+        logger.debug(f"Moved {moved} subgraph buffers to {device}")
 
 
 def offload_subgraph_weights(
@@ -298,6 +560,47 @@ def offload_subgraph_weights(
             attr = parts[-1]
             param = getattr(module, attr, None)
         except AttributeError:
+            continue
+
+        # Handle unfused MoE experts: if the module is a ModuleList and the
+        # fused attr doesn't exist, offload all child expert params instead
+        if param is None and isinstance(module, torch.nn.ModuleList):
+            for child in module:
+                for _, p in child.named_parameters(recurse=True):
+                    if isinstance(p, torch.nn.Parameter) and p.device != target_device:
+                        freed_count += 1
+                # Offload entire child to target device
+                for pname in list(child._parameters.keys()):
+                    p = child._parameters[pname]
+                    if p is not None and p.device != target_device:
+                        if target_device.type == "meta":
+                            child._parameters[pname] = torch.nn.Parameter(
+                                torch.empty_like(p, device="meta"),
+                                requires_grad=p.requires_grad,
+                            )
+                        else:
+                            child._parameters[pname] = torch.nn.Parameter(
+                                p.data.to(target_device),
+                                requires_grad=p.requires_grad,
+                            )
+                # Also handle nested Linear modules in each expert MLP
+                for _, submod in child.named_modules():
+                    if submod is child:
+                        continue
+                    for pname in list(submod._parameters.keys()):
+                        p = submod._parameters[pname]
+                        if p is not None and p.device != target_device:
+                            if target_device.type == "meta":
+                                submod._parameters[pname] = torch.nn.Parameter(
+                                    torch.empty_like(p, device="meta"),
+                                    requires_grad=p.requires_grad,
+                                )
+                            else:
+                                submod._parameters[pname] = torch.nn.Parameter(
+                                    p.data.to(target_device),
+                                    requires_grad=p.requires_grad,
+                                )
+                            freed_count += 1
             continue
 
         if isinstance(param, torch.nn.Parameter) and param.device != target_device:
@@ -394,6 +697,74 @@ def _set_parameter(model: Module, param_name: str, tensor: torch.Tensor) -> None
         setattr(module, param_attr, tensor)
 
 
+def _try_set_fused_moe(
+    model: Module, param_name: str, tensor: torch.Tensor
+) -> bool:
+    """
+    Handle fused MoE expert tensors when the model has been unfused by
+    MoE calibration modules (e.g., SequentialQwen3_5MoeExperts).
+
+    When ``moe_calibration_context`` replaces a fused ``Qwen3_5MoeExperts``
+    module with a ``ModuleList`` of individual MLPs, the fused parameter names
+    (e.g., ``experts.gate_up_proj``) no longer exist on the model. This function
+    detects such cases and splits the 3D tensor across individual experts.
+
+    :param model: the full model
+    :param param_name: weight name from the weight map (fused naming)
+    :param tensor: the fused 3D tensor loaded from safetensors
+    :return: True if handled (fused MoE split), False if not applicable
+    """
+    if tensor.dim() != 3:
+        return False
+
+    parts = param_name.split(".")
+    attr = parts[-1]  # e.g., "gate_up_proj" or "down_proj"
+
+    # Navigate to parent module
+    module = model
+    try:
+        for part in parts[:-1]:
+            module = getattr(module, part)
+    except AttributeError:
+        return False
+
+    # Check if parent is a ModuleList (unfused experts)
+    if not isinstance(module, torch.nn.ModuleList):
+        return False
+
+    num_experts = len(module)
+    if tensor.shape[0] != num_experts:
+        return False
+
+    if attr == "gate_up_proj":
+        intermediate_size = tensor.shape[1] // 2
+        for i in range(num_experts):
+            gate_up = tensor[i]  # [2*intermediate, hidden]
+            module[i].gate_proj.weight = torch.nn.Parameter(
+                gate_up[:intermediate_size, :].clone().contiguous()
+            )
+            module[i].up_proj.weight = torch.nn.Parameter(
+                gate_up[intermediate_size:, :].clone().contiguous()
+            )
+        logger.debug(
+            f"Split fused gate_up_proj into {num_experts} experts "
+            f"for {'.'.join(parts[:-1])}"
+        )
+        return True
+    elif attr == "down_proj":
+        for i in range(num_experts):
+            module[i].down_proj.weight = torch.nn.Parameter(
+                tensor[i].clone().contiguous()
+            )
+        logger.debug(
+            f"Split fused down_proj into {num_experts} experts "
+            f"for {'.'.join(parts[:-1])}"
+        )
+        return True
+
+    return False
+
+
 def _move_quantization_buffers(
     model: Module, weight_names: list[str], device: torch.device
 ) -> None:
@@ -424,53 +795,65 @@ def _move_quantization_buffers(
         except AttributeError:
             continue
 
-        # Move all meta-device parameters and buffers on this module
-        for attr_name in list(module._parameters.keys()):
-            param = module._parameters[attr_name]
-            if param is not None and param.device.type == "meta":
-                new_param = torch.nn.Parameter(
-                    torch.zeros(param.shape, dtype=param.dtype, device=device),
-                    requires_grad=param.requires_grad,
-                )
-                module._parameters[attr_name] = new_param
-                moved_count += 1
+        # For unfused MoE experts (ModuleList), we need to process all
+        # descendant modules too, not just the container. The weight names
+        # use fused keys (e.g., "experts.gate_up_proj") but after MoE
+        # calibration the model has individual expert modules with their
+        # own quantization buffers (e.g., "experts.0.gate_proj.weight_scale").
+        modules_to_process = [module]
+        if isinstance(module, torch.nn.ModuleList):
+            modules_to_process.extend(
+                m for m in module.modules() if m is not module
+            )
 
-        for attr_name in list(module._buffers.keys()):
-            buf = module._buffers[attr_name]
-            if buf is not None and buf.device.type == "meta":
-                module._buffers[attr_name] = torch.zeros(
-                    buf.shape, dtype=buf.dtype, device=device
-                )
-                moved_count += 1
+        for mod in modules_to_process:
+            # Move all meta-device parameters and buffers on this module
+            for attr_name in list(mod._parameters.keys()):
+                param = mod._parameters[attr_name]
+                if param is not None and param.device.type == "meta":
+                    new_param = torch.nn.Parameter(
+                        torch.zeros(param.shape, dtype=param.dtype, device=device),
+                        requires_grad=param.requires_grad,
+                    )
+                    mod._parameters[attr_name] = new_param
+                    moved_count += 1
 
-        # Move observer modules if they exist
-        for attr_name in dir(module):
-            if attr_name.endswith("_observer"):
-                observer = getattr(module, attr_name, None)
-                if observer is not None and isinstance(observer, Module):
-                    for pname, param in observer.named_parameters():
-                        if param.device.type == "meta":
-                            parts_p = pname.split(".")
-                            target = observer
-                            for p in parts_p[:-1]:
-                                target = getattr(target, p)
-                            target._parameters[parts_p[-1]] = torch.nn.Parameter(
-                                torch.zeros(
-                                    param.shape, dtype=param.dtype, device=device
-                                ),
-                                requires_grad=param.requires_grad,
-                            )
-                            moved_count += 1
-                    for bname, buf in observer.named_buffers():
-                        if buf.device.type == "meta":
-                            parts_b = bname.split(".")
-                            target = observer
-                            for p in parts_b[:-1]:
-                                target = getattr(target, p)
-                            target._buffers[parts_b[-1]] = torch.zeros(
-                                buf.shape, dtype=buf.dtype, device=device
-                            )
-                            moved_count += 1
+            for attr_name in list(mod._buffers.keys()):
+                buf = mod._buffers[attr_name]
+                if buf is not None and buf.device.type == "meta":
+                    mod._buffers[attr_name] = torch.zeros(
+                        buf.shape, dtype=buf.dtype, device=device
+                    )
+                    moved_count += 1
+
+            # Move observer modules if they exist
+            for attr_name in dir(mod):
+                if attr_name.endswith("_observer"):
+                    observer = getattr(mod, attr_name, None)
+                    if observer is not None and isinstance(observer, Module):
+                        for pname, param in observer.named_parameters():
+                            if param.device.type == "meta":
+                                parts_p = pname.split(".")
+                                target = observer
+                                for p in parts_p[:-1]:
+                                    target = getattr(target, p)
+                                target._parameters[parts_p[-1]] = torch.nn.Parameter(
+                                    torch.zeros(
+                                        param.shape, dtype=param.dtype, device=device
+                                    ),
+                                    requires_grad=param.requires_grad,
+                                )
+                                moved_count += 1
+                        for bname, buf in observer.named_buffers():
+                            if buf.device.type == "meta":
+                                parts_b = bname.split(".")
+                                target = observer
+                                for p in parts_b[:-1]:
+                                    target = getattr(target, p)
+                                target._buffers[parts_b[-1]] = torch.zeros(
+                                    buf.shape, dtype=buf.dtype, device=device
+                                )
+                                moved_count += 1
 
     if moved_count > 0:
         logger.debug(
@@ -515,6 +898,7 @@ def compress_and_save_subgraph(
     output_dir: str | os.PathLike,
     shard_index: int,
     shard_weight_map: dict[str, str],
+    model_to_safetensors: dict[str, str] | None = None,
 ) -> int:
     """
     Compress quantized modules for the given weight names in-place, then save
@@ -530,6 +914,8 @@ def compress_and_save_subgraph(
     :param output_dir: directory to save safetensors shards
     :param shard_index: index for naming the shard file
     :param shard_weight_map: dict to update with weight_name -> shard_file mappings
+    :param model_to_safetensors: optional mapping from model param name to
+        original safetensors key (for saving with original naming convention)
     :return: total size in bytes of saved tensors
     """
     from compressed_tensors.compressors.base import compress_module
@@ -556,14 +942,46 @@ def compress_and_save_subgraph(
         except AttributeError:
             continue
 
-        if is_module_quantized(module):
-            compress_module(module)
-            compressed_count += 1
+        # For unfused MoE experts (ModuleList), compress each child's
+        # quantized submodules instead of the ModuleList itself
+        modules_to_compress = []
+        if isinstance(module, torch.nn.ModuleList):
+            for child in module:
+                for _, submod in child.named_modules():
+                    modules_to_compress.append(submod)
+        else:
+            modules_to_compress.append(module)
+
+        for mod in modules_to_compress:
+            if is_module_quantized(mod):
+                # Ensure all params/buffers are on the same device before compression
+                devices = set()
+                for p in mod.parameters():
+                    if p.device.type != "meta":
+                        devices.add(p.device)
+                for b in mod.buffers():
+                    if b.device.type != "meta":
+                        devices.add(b.device)
+                if len(devices) > 1:
+                    # Move everything to CPU for consistent compression
+                    for pname, param in mod.named_parameters(recurse=False):
+                        if param.device.type != "cpu" and param.device.type != "meta":
+                            mod._parameters[pname] = torch.nn.Parameter(
+                                param.data.cpu(), requires_grad=param.requires_grad
+                            )
+                    for bname in list(mod._buffers.keys()):
+                        buf = mod._buffers[bname]
+                        if buf is not None and buf.device.type != "cpu" and buf.device.type != "meta":
+                            mod._buffers[bname] = buf.cpu()
+                compress_module(mod)
+                compressed_count += 1
 
     if compressed_count > 0:
         logger.debug(f"Compressed {compressed_count} quantized modules in subgraph")
 
-    # Collect all non-meta tensors (parameters + buffers) from these modules
+    # Collect all non-meta tensors (parameters + buffers) from these modules.
+    # For unfused MoE (ModuleList), recurse into children to capture all
+    # individual expert parameters.
     tensors = {}
     for prefix in module_prefixes:
         try:
@@ -574,18 +992,69 @@ def compress_and_save_subgraph(
         except AttributeError:
             continue
 
-        for pname, param in module.named_parameters(recurse=False):
+        use_recurse = isinstance(module, torch.nn.ModuleList)
+
+        for pname, param in module.named_parameters(recurse=use_recurse):
             full_name = f"{prefix}.{pname}"
             if param.device.type != "meta":
                 tensors[full_name] = param.data.contiguous().cpu()
 
-        for bname, buf in module.named_buffers(recurse=False):
+        for bname, buf in module.named_buffers(recurse=use_recurse):
             full_name = f"{prefix}.{bname}"
             if buf.device.type != "meta":
                 tensors[full_name] = buf.contiguous().cpu()
 
     if not tensors:
         return 0
+
+    # Remap keys back to original safetensors naming for VL model compatibility.
+    # This handles both original weights (in model_to_safetensors) and new
+    # quantization params (weight_scale, weight_zero_point, etc.) that share
+    # the same module prefix but weren't in the original safetensors.
+    if model_to_safetensors:
+        # Build a prefix mapping from model prefix -> safetensors prefix
+        # e.g., "model.layers.0.self_attn.q_proj" -> "model.language_model.layers.0.self_attn.q_proj"
+        prefix_map: dict[str, str] = {}
+        for model_key, sf_key in model_to_safetensors.items():
+            model_prefix = model_key.rsplit(".", 1)[0] if "." in model_key else ""
+            sf_prefix = sf_key.rsplit(".", 1)[0] if "." in sf_key else ""
+            if model_prefix and sf_prefix and model_prefix not in prefix_map:
+                prefix_map[model_prefix] = sf_prefix
+
+        def _remap_prefix(name: str) -> str:
+            """Find the best prefix mapping for a tensor name.
+
+            First tries an exact prefix match, then walks up parent prefixes.
+            This handles unfused MoE expert names like
+            ``model.layers.0.mlp.experts.0.gate_proj.weight`` which have
+            prefix ``model.layers.0.mlp.experts`` in the map but the full
+            module prefix ``model.layers.0.mlp.experts.0.gate_proj`` is not.
+            """
+            module_prefix = name.rsplit(".", 1)[0] if "." in name else ""
+            param_suffix = name[len(module_prefix) + 1:] if module_prefix else name
+
+            # Exact match
+            if module_prefix in prefix_map:
+                return f"{prefix_map[module_prefix]}.{param_suffix}"
+
+            # Walk up parent prefixes
+            parts = module_prefix.split(".")
+            for i in range(len(parts) - 1, 0, -1):
+                parent = ".".join(parts[:i])
+                if parent in prefix_map:
+                    child_suffix = ".".join(parts[i:])
+                    return f"{prefix_map[parent]}.{child_suffix}.{param_suffix}"
+
+            return name
+
+        remapped_tensors = {}
+        for name, tensor in tensors.items():
+            if name in model_to_safetensors:
+                # Exact match: use the known mapping
+                remapped_tensors[model_to_safetensors[name]] = tensor
+            else:
+                remapped_tensors[_remap_prefix(name)] = tensor
+        tensors = remapped_tensors
 
     # Save to shard file
     shard_name = f"model-{shard_index + 1:05d}-of-99999.safetensors"

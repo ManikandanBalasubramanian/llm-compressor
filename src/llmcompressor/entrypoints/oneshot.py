@@ -299,8 +299,7 @@ class Oneshot:
             user_pipeline = self.dataset_args.pipeline
             # Auto-select layerwise pipeline when model is on meta device
             if (
-                user_pipeline is None
-                and hasattr(self.model, "device")
+                hasattr(self.model, "device")
                 and self.model.device.type == "meta"
             ):
                 user_pipeline = "layerwise"
