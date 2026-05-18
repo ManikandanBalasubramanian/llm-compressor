@@ -188,6 +188,60 @@ _glm4_moe_lite_mappings = [
     AWQMapping("re:.*up_proj$", ["re:.*down_proj$"]),
 ]
 
+# Qwen3.5 uses a hybrid attention architecture: some layers have standard
+# self_attn (q/k/v/o_proj) while others use linear_attn (GatedDeltaNet with
+# in_proj_qkv, in_proj_z, in_proj_a, in_proj_b, out_proj). Both patterns
+# must be included so AWQ smooths all layers.
+_qwen3_5_mappings = [
+    AWQMapping(
+        "re:.*input_layernorm$",
+        [
+            # self_attn layers
+            "re:.*self_attn.q_proj$",
+            "re:.*self_attn.k_proj$",
+            "re:.*self_attn.v_proj$",
+            # linear_attn (GatedDeltaNet) layers
+            "re:.*linear_attn.in_proj_qkv$",
+            "re:.*linear_attn.in_proj_z$",
+            "re:.*linear_attn.in_proj_a$",
+            "re:.*linear_attn.in_proj_b$",
+        ],
+    ),
+    AWQMapping("re:.*v_proj$", ["re:.*o_proj$"]),
+    AWQMapping(
+        "re:.*post_attention_layernorm$",
+        ["re:.*gate_proj$", "re:.*up_proj$"],
+    ),
+    AWQMapping("re:.*up_proj$", ["re:.*down_proj$"]),
+]
+
+_qwen3_5_moe_mappings = [
+    AWQMapping(
+        "re:.*input_layernorm$",
+        [
+            # self_attn layers
+            "re:.*self_attn.q_proj$",
+            "re:.*self_attn.k_proj$",
+            "re:.*self_attn.v_proj$",
+            # linear_attn (GatedDeltaNet) layers
+            "re:.*linear_attn.in_proj_qkv$",
+            "re:.*linear_attn.in_proj_z$",
+            "re:.*linear_attn.in_proj_a$",
+            "re:.*linear_attn.in_proj_b$",
+        ],
+    ),
+    AWQMapping("re:.*v_proj$", ["re:.*o_proj$"]),
+    AWQMapping(
+        "re:.*post_attention_layernorm$",
+        [
+            "re:.*mlp.gate$",
+            "re:.*mlp.experts.*.gate_proj$",
+            "re:.*mlp.experts.*.up_proj$",
+        ],
+    ),
+    AWQMapping("re:.*up_proj$", ["re:.*down_proj$"]),
+]
+
 _bloom_mappings = [
     AWQMapping("re:.*input_layernorm$", ["re:.*query_key_value$"]),
     AWQMapping("re:.*post_attention_layernorm$", ["re:.*dense_h_to_4h$"]),
@@ -283,7 +337,8 @@ AWQ_MAPPING_REGISTRY: dict[str, list[AWQMapping]] = {
     "Qwen2MoeForCausalLM": _moe_default_mappings,
     "Qwen3ForCausalLM": default_mappings,
     "Qwen3MoeForCausalLM": _moe_default_mappings,
-    "Qwen3_5MoeForCausalLM": _moe_default_mappings,
+    "Qwen3_5ForCausalLM": _qwen3_5_mappings,
+    "Qwen3_5MoeForCausalLM": _qwen3_5_moe_mappings,
     "SeedOssForCausalLM": default_mappings,
     "Ernie4_5_MoeForCausalLM": default_mappings,
 }

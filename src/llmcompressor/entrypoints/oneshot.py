@@ -14,6 +14,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
+from compressed_tensors import ModelCompressor
 from loguru import logger
 from torch.utils.data import DataLoader
 from transformers import PreTrainedModel, PreTrainedTokenizerBase, ProcessorMixin
@@ -25,6 +26,13 @@ from llmcompressor.entrypoints.utils import post_process, pre_process
 from llmcompressor.modeling.moe_context import moe_calibration_context
 from llmcompressor.modeling.offset_norm import norm_calibration_context
 from llmcompressor.pipelines import CalibrationPipeline
+from llmcompressor.pytorch.model_load.helpers import (
+    copy_python_files_from_model_cache,
+)
+from llmcompressor.transformers.compression.compressed_tensors_utils import (
+    modify_save_pretrained,
+    update_and_save_recipe,
+)
 
 __all__ = ["Oneshot", "oneshot"]
 
@@ -190,8 +198,7 @@ class Oneshot:
         # For layerwise compress-as-you-go: pass output_dir to the pipeline
         # so it can save compressed shards incrementally
         if getattr(self.model_args, "layerwise", False) and self.output_dir:
-            import os
-            os.environ["LLMCOMPRESSOR_OUTPUT_DIR"] = self.output_dir
+            self.dataset_args.output_dir = self.output_dir
 
         self.apply_recipe_modifiers(
             calibration_dataloader=calibration_dataloader,
@@ -209,44 +216,86 @@ class Oneshot:
         if layerwise_saved:
             # Shards already compressed and saved by the pipeline.
             # Just save config, tokenizer, and recipe.
-            import os
-            from compressed_tensors import ModelCompressor
-            from llmcompressor.transformers.compression.compressed_tensors_utils import (
-                update_and_save_recipe,
-            )
-            from llmcompressor.pytorch.model_load.helpers import (
-                copy_python_files_from_model_cache,
-            )
-
             output_dir = self.output_dir
             if (
                 self.recipe_args is not None
-                and getattr(self.recipe_args, "stage", None) is not None
+                and getattr(self.recipe_args, "stage", None)
+                is not None
             ):
-                output_dir = os.path.join(output_dir, self.recipe_args.stage)
+                output_dir = os.path.join(
+                    output_dir, self.recipe_args.stage
+                )
 
-            # Save model config with quantization metadata
-            self.model.config.save_pretrained(output_dir)
+            # Save model config with quantization metadata.
+            # For VL/multimodal models, the CausalLM model's config is the
+            # text-only subconfig. Use the original config from model_path so
+            # the output can be loaded as the full VL model at inference.
+            from transformers import AutoConfig
+
+            try:
+                original_config = AutoConfig.from_pretrained(
+                    self.model.name_or_path, trust_remote_code=True
+                )
+                original_config.save_pretrained(output_dir)
+            except (OSError, ValueError):
+                self.model.config.save_pretrained(output_dir)
 
             # Update config with compression info
-            compressor = ModelCompressor.from_pretrained_model(self.model)
+            compressor = ModelCompressor.from_pretrained_model(
+                self.model
+            )
             compressor.update_config(output_dir)
+
+            # Add passthrough module names to quantization config ignore
+            # list and fix status. Passthrough weights (visual encoder, MTP)
+            # are saved as regular float tensors. Without explicit ignore
+            # entries, serving frameworks treat them as quantized and fail.
+            import json
+
+            config_path = os.path.join(output_dir, "config.json")
+            with open(config_path) as f:
+                config_data = json.load(f)
+            if "quantization_config" in config_data:
+                qconfig = config_data["quantization_config"]
+
+                # Status must be "compressed" since layerwise saves
+                # pack-quantized weights directly to disk.
+                qconfig["quantization_status"] = "compressed"
+
+                # Add explicit module names for passthrough layers
+                passthrough_names = getattr(
+                    self.dataset_args, "passthrough_module_names", None
+                )
+                if passthrough_names:
+                    ignore = qconfig.get("ignore", [])
+                    for name in passthrough_names:
+                        if name not in ignore:
+                            ignore.append(name)
+                    qconfig["ignore"] = ignore
+                    logger.info(
+                        f"Added {len(passthrough_names)} passthrough "
+                        f"modules to ignore list"
+                    )
+
+                with open(config_path, "w") as f:
+                    json.dump(config_data, f, indent=2, sort_keys=True)
 
             # Save tokenizer/processor
             if self.model_args.processor is not None:
                 self.model_args.processor.save_pretrained(output_dir)
 
             # Save recipe
-            update_and_save_recipe(self.model.name_or_path, output_dir)
+            update_and_save_recipe(
+                self.model.name_or_path, output_dir
+            )
             copy_python_files_from_model_cache(self.model, output_dir)
 
-            logger.info(f"Layerwise compress-as-you-go: saved to {output_dir}")
+            logger.info(
+                f"Layerwise compress-as-you-go: saved to {output_dir}"
+            )
         else:
             # Legacy path: wrap save_pretrained for compressed saving
             if getattr(self.model_args, "layerwise", False):
-                from llmcompressor.transformers.compression.compressed_tensors_utils import (
-                    modify_save_pretrained,
-                )
                 modify_save_pretrained(self.model)
 
             post_process(
@@ -254,10 +303,6 @@ class Oneshot:
                 recipe_args=self.recipe_args,
                 output_dir=self.output_dir,
             )
-
-        # Clean up env var
-        if "LLMCOMPRESSOR_OUTPUT_DIR" in os.environ:
-            del os.environ["LLMCOMPRESSOR_OUTPUT_DIR"]
 
     def apply_recipe_modifiers(
         self,

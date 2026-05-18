@@ -14,14 +14,12 @@ import json
 import os
 import threading
 from pathlib import Path
-from typing import Any
 
 import torch
 from loguru import logger
 from safetensors import safe_open
 from safetensors.torch import save_file
 from torch.nn import Module
-
 
 __all__ = [
     "build_weight_map",
@@ -97,12 +95,9 @@ def _detect_tied_weights(
             # Common pattern: lm_head.weight is tied to embed_tokens.weight
             # Find the embed_tokens weight in weight_map
             embed_key = None
-            lm_head_key = None
             for key in weight_map:
                 if "embed_tokens.weight" in key:
                     embed_key = key
-                if key.endswith("lm_head.weight") or key == "lm_head.weight":
-                    lm_head_key = key
 
             # Also find lm_head.weight in model params (even if not in wm)
             lm_head_param = None
@@ -210,7 +205,8 @@ def build_key_remapping(
                 prefix_to_add = ""
                 break
             # Try matching by the portion after the first dot segment
-            # e.g., model="model.layers.0.weight" vs sf="model.language_model.layers.0.weight"
+            # e.g., model="model.layers.0.weight" vs
+            # sf="model.language_model.layers.0.weight"
             # Find common suffix
             mp_parts = model_param.split(".")
             sf_parts = sf_key.split(".")
@@ -639,7 +635,8 @@ def move_subgraph_buffers(
     the forward pass.
 
     :param model: the model (not used directly, but kept for API consistency)
-    :param subgraph_modules: set of modules from ``subgraph.submodules(model, recurse=True)``
+    :param subgraph_modules: set of modules from
+        ``subgraph.submodules(model, recurse=True)``
     :param device: target device to move buffers to
     """
     moved = 0
@@ -1087,7 +1084,11 @@ def compress_and_save_subgraph(
                             )
                     for bname in list(mod._buffers.keys()):
                         buf = mod._buffers[bname]
-                        if buf is not None and buf.device.type != "cpu" and buf.device.type != "meta":
+                        if (
+                            buf is not None
+                            and buf.device.type != "cpu"
+                            and buf.device.type != "meta"
+                        ):
                             mod._buffers[bname] = buf.cpu()
                 compress_module(mod)
                 compressed_count += 1
@@ -1129,7 +1130,8 @@ def compress_and_save_subgraph(
     # the same module prefix but weren't in the original safetensors.
     if model_to_safetensors:
         # Build a prefix mapping from model prefix -> safetensors prefix
-        # e.g., "model.layers.0.self_attn.q_proj" -> "model.language_model.layers.0.self_attn.q_proj"
+        # e.g., "model.layers.0.self_attn.q_proj" ->
+        # "model.language_model.layers.0.self_attn.q_proj"
         prefix_map: dict[str, str] = {}
         for model_key, sf_key in model_to_safetensors.items():
             model_prefix = model_key.rsplit(".", 1)[0] if "." in model_key else ""

@@ -67,31 +67,6 @@ if TYPE_CHECKING:
 __all__ = ["LayerwisePipeline"]
 
 
-def _save_original_config(
-    model_path: str, output_dir: str | os.PathLike
-) -> None:
-    """
-    Save the original model config from model_path to output_dir.
-
-    For VL/multimodal models, the CausalLM model's config is the text-only
-    config. This function copies the original ConditionalGeneration config
-    so the quantized output can be loaded as the full VL model at inference.
-    """
-    from transformers import AutoConfig
-
-    try:
-        original_config = AutoConfig.from_pretrained(
-            model_path, trust_remote_code=True
-        )
-        original_config.save_pretrained(output_dir)
-        logger.info(
-            f"Saved original VL config ({original_config.architectures}) "
-            f"to {output_dir}"
-        )
-    except Exception as e:
-        logger.warning(f"Could not save original VL config: {e}")
-
-
 def _get_batches(
     activations: IntermediatesCache,
     num_batches: int,
@@ -231,8 +206,27 @@ class LayerwisePipeline(CalibrationPipeline):
                 f"(was {len(original_passthrough)} before)"
             )
 
+        # Store passthrough module names so oneshot can add them to the
+        # quantization config's ignore list (prevents serving frameworks from
+        # treating passthrough float weights as quantized).
+        if raw_passthrough_keys:
+            # Convert weight keys to module names (strip .weight/.bias suffix)
+            # and deduplicate (some modules have both weight and bias)
+            module_names: set[str] = set()
+            for k in raw_passthrough_keys:
+                if k.endswith(".weight") or k.endswith(".bias"):
+                    module_names.add(k.rsplit(".", 1)[0])
+                else:
+                    module_names.add(k)
+            dataset_args.passthrough_module_names = sorted(module_names)
+
         # Check for resume mode (skip already-completed subgraphs)
         resume_from = int(os.environ.get("LAYERWISE_RESUME_FROM", "0"))
+        if resume_from >= num_subgraphs:
+            raise ValueError(
+                f"LAYERWISE_RESUME_FROM={resume_from} is >= total "
+                f"subgraphs ({num_subgraphs}). Nothing to resume."
+            )
         if resume_from > 0:
             logger.info(
                 f"Resuming from subgraph {resume_from + 1}/{num_subgraphs} "
@@ -242,9 +236,6 @@ class LayerwisePipeline(CalibrationPipeline):
 
         # Determine output directory for compress-as-you-go shard saving
         output_dir = getattr(dataset_args, "output_dir", None)
-        if output_dir is None:
-            # Try to get from the oneshot output_dir via model config
-            output_dir = os.environ.get("LLMCOMPRESSOR_OUTPUT_DIR")
 
         # Track compressed shards for index writing
         shard_weight_map: dict[str, str] = {}
@@ -452,11 +443,6 @@ class LayerwisePipeline(CalibrationPipeline):
                     write_safetensors_index(
                         output_dir, shard_weight_map, total_saved_size
                     )
-
-                # For VL models: save the original config so the output loads
-                # as the full VL model (ConditionalGeneration) at inference
-                if passthrough_keys and model_path:
-                    _save_original_config(model_path, output_dir)
 
             # If we didn't use compress-as-you-go, move remaining GPU tensors to CPU
             if output_dir is None:
