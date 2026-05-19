@@ -1012,6 +1012,7 @@ def compress_and_save_subgraph(
     shard_index: int,
     shard_weight_map: dict[str, str],
     model_to_safetensors: dict[str, str] | None = None,
+    tied_weights: dict[str, str] | None = None,
 ) -> int:
     """
     Compress quantized modules for the given weight names in-place, then save
@@ -1120,6 +1121,16 @@ def compress_and_save_subgraph(
             full_name = f"{prefix}.{bname}"
             if buf.device.type != "meta":
                 tensors[full_name] = buf.contiguous().cpu()
+
+    if not tensors:
+        return 0
+
+    # Skip tied weight aliases (e.g., lm_head.weight when tied to
+    # embed_tokens.weight). The canonical copy is saved under its own name;
+    # the framework restores the tie at load time via config flags.
+    if tied_weights:
+        for alias in tied_weights:
+            tensors.pop(alias, None)
 
     if not tensors:
         return 0

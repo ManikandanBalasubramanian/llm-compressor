@@ -397,6 +397,7 @@ class LayerwisePipeline(CalibrationPipeline):
                         model, weight_names, output_dir,
                         subgraph_index, shard_weight_map,
                         model_to_safetensors=model_to_safetensors,
+                        tied_weights=tied_weights,
                     )
                     total_saved_size += saved_size
                     logger.info(
