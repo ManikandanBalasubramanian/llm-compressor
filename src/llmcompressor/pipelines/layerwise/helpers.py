@@ -664,73 +664,57 @@ def offload_subgraph_weights(
     target_device = torch.device(device)
     freed_count = 0
 
-    for param_name in weight_names:
-        parts = param_name.split(".")
-        module = model
+    # Extract unique module prefixes from weight names
+    module_prefixes = set()
+    for name in weight_names:
+        parts = name.rsplit(".", 1)
+        if len(parts) == 2:
+            module_prefixes.add(parts[0])
+
+    for prefix in module_prefixes:
         try:
-            for part in parts[:-1]:
+            parts = prefix.split(".")
+            module = model
+            for part in parts:
                 module = getattr(module, part)
-            attr = parts[-1]
-            param = getattr(module, attr, None)
         except AttributeError:
             continue
 
-        # Handle unfused MoE experts: if the module is a ModuleList and the
-        # fused attr doesn't exist, offload all child expert params instead
-        if param is None and isinstance(module, torch.nn.ModuleList):
-            for child in module:
-                for _, p in child.named_parameters(recurse=True):
-                    if isinstance(p, torch.nn.Parameter) and p.device != target_device:
-                        freed_count += 1
-                # Offload entire child to target device
-                for pname in list(child._parameters.keys()):
-                    p = child._parameters[pname]
-                    if p is not None and p.device != target_device:
-                        if target_device.type == "meta":
-                            child._parameters[pname] = torch.nn.Parameter(
-                                torch.empty_like(p, device="meta"),
-                                requires_grad=p.requires_grad,
-                            )
-                        else:
-                            child._parameters[pname] = torch.nn.Parameter(
-                                p.data.to(target_device),
-                                requires_grad=p.requires_grad,
-                            )
-                # Also handle nested Linear modules in each expert MLP
-                for _, submod in child.named_modules():
-                    if submod is child:
-                        continue
-                    for pname in list(submod._parameters.keys()):
-                        p = submod._parameters[pname]
-                        if p is not None and p.device != target_device:
-                            if target_device.type == "meta":
-                                submod._parameters[pname] = torch.nn.Parameter(
-                                    torch.empty_like(p, device="meta"),
-                                    requires_grad=p.requires_grad,
-                                )
-                            else:
-                                submod._parameters[pname] = torch.nn.Parameter(
-                                    p.data.to(target_device),
-                                    requires_grad=p.requires_grad,
-                                )
-                            freed_count += 1
-            continue
-
-        if isinstance(param, torch.nn.Parameter) and param.device != target_device:
-            if target_device.type == "meta":
-                new_data = torch.empty_like(param, device="meta")
-            else:
-                new_data = param.data.to(target_device)
-
-            new_param = torch.nn.Parameter(
-                new_data,
-                requires_grad=param.requires_grad,
+        # For unfused MoE experts, process all descendant modules
+        modules_to_process = [module]
+        if isinstance(module, torch.nn.ModuleList):
+            modules_to_process.extend(
+                m for m in module.modules() if m is not module
             )
-            module._parameters[attr] = new_param
-            freed_count += 1
+
+        for mod in modules_to_process:
+            for attr_name in list(mod._parameters.keys()):
+                param = mod._parameters[attr_name]
+                if param is not None and param.device != target_device:
+                    if target_device.type == "meta":
+                        new_param = torch.nn.Parameter(
+                            torch.empty_like(param, device="meta"),
+                            requires_grad=param.requires_grad,
+                        )
+                    else:
+                        new_param = torch.nn.Parameter(
+                            param.data.to(target_device),
+                            requires_grad=param.requires_grad,
+                        )
+                    mod._parameters[attr_name] = new_param
+                    freed_count += 1
+
+            for attr_name in list(mod._buffers.keys()):
+                buf = mod._buffers[attr_name]
+                if buf is not None and buf.device != target_device:
+                    if target_device.type == "meta":
+                        mod._buffers[attr_name] = torch.empty_like(buf, device="meta")
+                    else:
+                        mod._buffers[attr_name] = buf.to(target_device)
+                    freed_count += 1
 
     if freed_count > 0:
-        logger.debug(f"Offloaded {freed_count} parameters to {device}")
+        logger.debug(f"Offloaded {freed_count} parameters/buffers to {device}")
         if device != "cpu":
             torch.cuda.empty_cache()
 
