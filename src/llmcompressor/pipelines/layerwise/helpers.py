@@ -784,12 +784,20 @@ def _set_parameter(model: Module, param_name: str, tensor: torch.Tensor) -> None
     :param param_name: fully qualified parameter name (e.g., "model.layers.0.weight")
     :param tensor: the real tensor to set
     """
+    from llmcompressor.modeling.offset_norm import NormCalibrationModule
+
     parts = param_name.split(".")
     module = model
     for part in parts[:-1]:
         module = getattr(module, part)
 
     param_attr = parts[-1]
+
+    # Apply weight transformation for norm calibration modules (e.g.,
+    # CalibrationOffsetNorm needs 1 + raw_weight when loaded from safetensors)
+    if isinstance(module, NormCalibrationModule):
+        tensor = module.transform_loaded_weight(param_attr, tensor)
+
     old_param = getattr(module, param_attr, None)
 
     if isinstance(old_param, torch.nn.Parameter):
@@ -1089,6 +1097,8 @@ def compress_and_save_subgraph(
     # Collect all non-meta tensors (parameters + buffers) from these modules.
     # For unfused MoE (ModuleList), recurse into children to capture all
     # individual expert parameters.
+    from llmcompressor.modeling.offset_norm import NormCalibrationModule
+
     tensors = {}
     for prefix in module_prefixes:
         try:
@@ -1104,7 +1114,12 @@ def compress_and_save_subgraph(
         for pname, param in module.named_parameters(recurse=use_recurse):
             full_name = f"{prefix}.{pname}"
             if param.device.type != "meta":
-                tensors[full_name] = param.data.contiguous().cpu()
+                tensor = param.data.contiguous().cpu()
+                # Reverse calibration transformation for norm modules so that
+                # saved weights are in the original (offset) convention
+                if isinstance(module, NormCalibrationModule):
+                    tensor = module.transform_save_weight(pname, tensor)
+                tensors[full_name] = tensor
 
         for bname, buf in module.named_buffers(recurse=use_recurse):
             full_name = f"{prefix}.{bname}"

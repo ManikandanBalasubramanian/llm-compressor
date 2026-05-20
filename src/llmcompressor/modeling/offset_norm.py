@@ -50,6 +50,43 @@ class NormCalibrationModule(ABC, torch.nn.Module, RegistryMixin):
         """
         ...
 
+    def transform_loaded_weight(
+        self, param_name: str, tensor: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Transform a weight tensor after it is loaded from safetensors.
+
+        In layerwise mode, weights are loaded per-subgraph AFTER the norm
+        calibration context has replaced norm modules. This method applies
+        the necessary transformation so that the loaded raw weights are
+        converted to the calibration convention.
+
+        Default implementation: no transformation (identity).
+
+        :param param_name: the local parameter name (e.g., "weight")
+        :param tensor: the raw tensor loaded from safetensors
+        :return: the transformed tensor
+        """
+        return tensor
+
+    def transform_save_weight(
+        self, param_name: str, tensor: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Transform a weight tensor before it is saved to safetensors.
+
+        In layerwise compress-as-you-go, subgraph weights are saved while
+        inside norm_calibration_context. This method reverses the calibration
+        transformation so that saved weights are in the original convention.
+
+        Default implementation: no transformation (identity).
+
+        :param param_name: the local parameter name (e.g., "weight")
+        :param tensor: the calibration-convention tensor
+        :return: the tensor in original (saveable) convention
+        """
+        return tensor
+
 
 @NormCalibrationModule.register(
     "GemmaRMSNorm",
@@ -79,6 +116,31 @@ class CalibrationOffsetNorm(NormCalibrationModule):
         self.weight = torch.nn.Parameter(
             (1.0 + original.weight.data.float()).to(original.weight.dtype)
         )
+
+    def transform_loaded_weight(
+        self, param_name: str, tensor: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Apply the offset transformation (1 + weight) when weights are loaded
+        from safetensors in layerwise mode. The raw safetensors weight is in
+        offset convention (forward computes output * (1 + weight)), but this
+        module expects standard convention (forward computes output * weight).
+        """
+        if param_name == "weight":
+            return (1.0 + tensor.float()).to(tensor.dtype)
+        return tensor
+
+    def transform_save_weight(
+        self, param_name: str, tensor: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Reverse the offset transformation (weight - 1) when saving weights
+        during layerwise compress-as-you-go. Converts from calibration
+        convention (weight) back to offset convention (weight - 1).
+        """
+        if param_name == "weight":
+            return (tensor.float() - 1.0).to(tensor.dtype)
+        return tensor
 
     def _norm(self, x: torch.Tensor) -> torch.Tensor:
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)

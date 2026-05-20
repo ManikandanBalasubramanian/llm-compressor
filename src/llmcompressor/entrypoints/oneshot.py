@@ -284,6 +284,23 @@ class Oneshot:
             if self.model_args.processor is not None:
                 self.model_args.processor.save_pretrained(output_dir)
 
+            # Copy auxiliary processor configs that processor.save_pretrained
+            # doesn't write (e.g. preprocessor_config.json for VL models).
+            # These are needed by serving frameworks like vLLM to load the
+            # image/video processor.
+            import shutil
+
+            model_path = self.model.name_or_path
+            for aux_file in (
+                "preprocessor_config.json",
+                "video_preprocessor_config.json",
+                "generation_config.json",
+            ):
+                src = os.path.join(model_path, aux_file)
+                dst = os.path.join(output_dir, aux_file)
+                if os.path.exists(src) and not os.path.exists(dst):
+                    shutil.copy2(src, dst)
+
             # Save recipe
             update_and_save_recipe(
                 self.model.name_or_path, output_dir
