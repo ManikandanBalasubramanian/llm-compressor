@@ -536,6 +536,15 @@ class AWQModifier(Modifier):
                     del self._smooth_activation_stats[mapping.smooth_name]
                     continue
 
+                # Move fp16 reference outputs to CPU to free GPU memory
+                # during grid search (only for layerwise quantization where
+                # GPU memory is constrained by sequential onloading).
+                is_layerwise = (
+                    active_session().state.pipeline_type == "layerwise"
+                )
+                if is_layerwise:
+                    fp16_outputs = [t.cpu() for t in fp16_outputs]
+
                 orig_layer_weights = {
                     balance_layer: balance_layer.weight.clone()
                     for balance_layer in mapping.balance_layers
@@ -604,6 +613,50 @@ class AWQModifier(Modifier):
             output[0] if isinstance(output, tuple) else output
             for output in outputs
         ]
+
+    @torch.no_grad()
+    def _run_samples_and_compute_loss(
+        self, module: Module, fp16_outputs: list[torch.Tensor]
+    ) -> float:
+        """Run samples through module and compute loss against fp16_outputs
+        in a streaming fashion to avoid holding all outputs in GPU memory."""
+        session = active_session()
+        loss_masks = session.state.loss_masks if session.state else None
+
+        cache = self._parent_args_cache[module]
+        use_prefetch = active_session().state.sequential_prefetch
+        batch_iter = cache.iter_prefetch() if use_prefetch else cache
+
+        device = get_execution_device(module)
+        loss = torch.tensor(0.0, device=device)
+        num_elements = torch.tensor(0, device=device)
+
+        for batch_idx, batch_kwargs in enumerate(batch_iter):
+            output = module(**batch_kwargs)
+            int_w_batch = output[0] if isinstance(output, tuple) else output
+
+            fp16_batch = fp16_outputs[batch_idx].to(device)
+
+            loss_mask = loss_masks[batch_idx] if loss_masks else None
+            if loss_mask is not None:
+                token_mask = loss_mask.to(device) == 1
+                fp16_masked = fp16_batch[token_mask]
+                int_w_masked = int_w_batch[token_mask]
+                loss += torch.nn.functional.mse_loss(
+                    fp16_masked.float(), int_w_masked.float(), reduction="sum"
+                )
+                num_elements += fp16_masked.numel()
+            else:
+                loss += torch.nn.functional.mse_loss(
+                    fp16_batch.float(),
+                    int_w_batch.float(),
+                    reduction="sum",
+                )
+                num_elements += fp16_batch.numel()
+
+            del output, int_w_batch, fp16_batch
+
+        return (loss / num_elements).item() if num_elements > 0 else 0.0
 
     def _compute_best_scale(
         self,
@@ -708,12 +761,15 @@ class AWQModifier(Modifier):
                         / _scalesview
                     ).to(balance_layer.weight.dtype)
 
-                # W_q * X
-                int_w_outputs = self._run_samples(mapping.parent)
-
-                # compute mean squared error (L2 norm)
-                loss = self._compute_loss(fp16_outputs, int_w_outputs)
-                del int_w_outputs
+                # W_q * X (streaming loss computation — no bulk output storage)
+                if is_layerwise:
+                    loss = self._run_samples_and_compute_loss(
+                        mapping.parent, fp16_outputs
+                    )
+                else:
+                    int_w_outputs = self._run_samples(mapping.parent)
+                    loss = self._compute_loss(fp16_outputs, int_w_outputs)
+                    del int_w_outputs
 
                 if initial_error is None:
                     initial_error = loss

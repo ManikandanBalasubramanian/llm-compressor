@@ -267,6 +267,7 @@ class LayerwisePipeline(CalibrationPipeline):
 
             sequential_prefetch = getattr(dataset_args, "sequential_prefetch", False)
             session.state.sequential_prefetch = sequential_prefetch
+            session.state.pipeline_type = "layerwise"
 
             for subgraph_index, subgraph in enumerate(subgraphs):
                 # Determine which weights this subgraph needs

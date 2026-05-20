@@ -148,10 +148,11 @@ def build_key_remapping(
     safetensors_keys = set(weight_map.keys())
 
     # Fast path: if keys already match substantially, no remapping needed.
-    # Require >50% of model params to be in safetensors keys to avoid
-    # false positives (e.g., MTP keys overlap but main model keys don't).
+    # Check overlap relative to safetensors keys (which are unique/non-dedup),
+    # since model_params from _all_named_parameters can be inflated by
+    # tied/shared weights appearing at multiple paths.
     overlap = model_params & safetensors_keys
-    overlap_ratio = len(overlap) / len(model_params) if model_params else 0
+    overlap_ratio = len(overlap) / len(safetensors_keys) if safetensors_keys else 0
     if overlap_ratio > 0.5:
         # Keys match directly — passthrough is anything not in model
         passthrough = sorted(safetensors_keys - model_params)
@@ -231,7 +232,11 @@ def build_key_remapping(
             "Key remapping: could not detect prefix mismatch between "
             "safetensors keys and model parameters. Proceeding without remapping."
         )
-        return dict(weight_map), {}, sorted(safetensors_keys)
+        result_wm = dict(weight_map)
+        tied = _detect_tied_weights(model, result_wm)
+        for tied_name, source_name in tied.items():
+            result_wm[tied_name] = result_wm[source_name]
+        return result_wm, {}, sorted(safetensors_keys - model_params), tied
 
     logger.info(
         f"Key remapping: detected prefix mismatch\n"
