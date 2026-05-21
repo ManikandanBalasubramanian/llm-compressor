@@ -501,12 +501,6 @@ class AWQModifier(Modifier):
             for mapping in self._resolved_mappings
             if mapping.smooth_name in self._smooth_activation_stats
         ]
-        logger.info(
-            f"[AWQ-DIAG] _apply_smoothing: "
-            f"total_resolved={len(self._resolved_mappings)}, "
-            f"to_smooth={len(mappings_to_smooth)}, "
-            f"stats_keys={list(self._smooth_activation_stats.keys())}"
-        )
         for mapping in tqdm(mappings_to_smooth, desc="Smoothing"):
             smooth_layer = mapping.smooth_layer
             balance_layers = mapping.balance_layers
@@ -519,15 +513,6 @@ class AWQModifier(Modifier):
             ):
                 # Compute output of unquantized module
                 fp16_outputs = self._run_samples(parent_module)
-                logger.info(
-                    f"[AWQ-DIAG] {mapping.smooth_name}: "
-                    f"fp16_outputs count={len(fp16_outputs)}, "
-                    f"shape={fp16_outputs[0].shape if fp16_outputs else 'N/A'}, "
-                    f"dtype={fp16_outputs[0].dtype if fp16_outputs else 'N/A'}, "
-                    f"mean={fp16_outputs[0].float().mean().item():.6f}, "
-                    f"std={fp16_outputs[0].float().std().item():.6f}, "
-                    f"absmax={fp16_outputs[0].float().abs().max().item():.6f}"
-                )
                 if len(fp16_outputs) == 0 or all(f.numel() == 0 for f in fp16_outputs):
                     logger.info(
                         f"Skipping smooth_layer {mapping.smooth_name}, no activations "
@@ -566,18 +551,7 @@ class AWQModifier(Modifier):
                         device = get_execution_device(parent_module)
                         free_vram, _ = torch.cuda.mem_get_info(device)
                         # Keep on GPU if fp16_outputs fit within 50% of free VRAM
-                        if fp16_bytes < free_vram * 0.5:
-                            logger.debug(
-                                f"[AWQ-OPT] Keeping fp16_outputs on GPU "
-                                f"({fp16_bytes / 1e6:.1f} MB, "
-                                f"{free_vram / 1e6:.1f} MB free)"
-                            )
-                        else:
-                            logger.debug(
-                                f"[AWQ-OPT] Offloading fp16_outputs to CPU "
-                                f"({fp16_bytes / 1e6:.1f} MB, "
-                                f"{free_vram / 1e6:.1f} MB free)"
-                            )
+                        if fp16_bytes >= free_vram * 0.5:
                             fp16_outputs = [t.cpu() for t in fp16_outputs]
                     except Exception:
                         # Fallback: offload to be safe
@@ -590,12 +564,6 @@ class AWQModifier(Modifier):
 
                 best_scales = self._compute_best_scale(
                     mapping, fp16_outputs, orig_layer_weights
-                )
-                logger.info(
-                    f"[AWQ-DIAG] {mapping.smooth_name}: best_scales "
-                    f"min={best_scales.min():.6f}, max={best_scales.max():.6f}, "
-                    f"mean={best_scales.float().mean():.6f}, "
-                    f"all_ones={torch.allclose(best_scales, torch.ones_like(best_scales))}"
                 )
 
                 @torch.no_grad()
@@ -638,27 +606,6 @@ class AWQModifier(Modifier):
                     _smooth(layer, orig_layer_weights)
                 _smooth(smooth_layer, orig_layer_weights)
 
-                # Log post-smoothing weight stats
-                for layer in balance_layers:
-                    w = layer.weight
-                    logger.info(
-                        f"[AWQ-DIAG] Post-smooth {mapping.smooth_name} "
-                        f"balance_layer weight: "
-                        f"shape={w.shape}, "
-                        f"mean={w.float().mean().item():.6f}, "
-                        f"std={w.float().std().item():.6f}, "
-                        f"absmax={w.float().abs().max().item():.6f}"
-                    )
-                sw = smooth_layer.weight
-                logger.info(
-                    f"[AWQ-DIAG] Post-smooth {mapping.smooth_name} "
-                    f"smooth_layer weight: "
-                    f"shape={sw.shape}, "
-                    f"mean={sw.float().mean().item():.6f}, "
-                    f"std={sw.float().std().item():.6f}, "
-                    f"absmax={sw.float().abs().max().item():.6f}"
-                )
-
                 # remove caches needed to smooth this mapping
                 del self._smooth_activation_stats[mapping.smooth_name]
                 del orig_layer_weights
@@ -678,17 +625,6 @@ class AWQModifier(Modifier):
             output[0] if isinstance(output, tuple) else output
             for output in outputs
         ]
-        # Log first batch input/output stats for diagnostics
-        if results and logger.level("DEBUG").no <= logger.level("INFO").no:
-            first = results[0]
-            logger.debug(
-                f"[AWQ-DIAG] _run_samples {module.__class__.__name__}: "
-                f"num_batches={len(results)}, "
-                f"first_output shape={first.shape}, dtype={first.dtype}, "
-                f"finite={first.isfinite().all().item()}, "
-                f"mean={first.float().mean().item():.6f}, "
-                f"std={first.float().std().item():.6f}"
-            )
         return results
 
     @torch.no_grad()
@@ -772,21 +708,8 @@ class AWQModifier(Modifier):
             x_sum, count = _allreduce_data_sum([x_sum, count])
         x_mean = x_sum.to(device) / count.to(device)
 
-        logger.info(
-            f"[AWQ-DIAG] {mapping.smooth_name}: "
-            f"x_mean shape={x_mean.shape}, "
-            f"x_mean range=[{x_mean.min().item():.6f}, {x_mean.max().item():.6f}], "
-            f"x_mean mean={x_mean.mean().item():.6f}, "
-            f"count={count.item() if count.numel()==1 else count.sum().item()}"
-        )
-
         if self.duo_scaling:
             w_mean = self._compute_layer_means(mapping.balance_layers).to(device)
-            logger.info(
-                f"[AWQ-DIAG] {mapping.smooth_name}: "
-                f"w_mean shape={w_mean.shape}, "
-                f"w_mean range=[{w_mean.min().item():.6f}, {w_mean.max().item():.6f}]"
-            )
 
         # Where appropriate, replace observers with memoryless_minmax
         # for duration of grid search
@@ -821,10 +744,6 @@ class AWQModifier(Modifier):
                     if fp16_bytes < free_vram * 0.4:
                         fp16_outputs = [t.to(device) for t in fp16_outputs]
                         _fp16_premoved = True
-                        logger.debug(
-                            f"[AWQ-OPT] Pre-moved fp16_outputs to GPU for "
-                            f"grid search ({fp16_bytes / 1e6:.1f} MB)"
-                        )
                 except Exception:
                     pass
 
@@ -913,15 +832,6 @@ class AWQModifier(Modifier):
             )
 
         err_reduction = best_error / initial_error if initial_error > 0 else 1.0
-        logger.info(
-            f"[AWQ-DIAG] Grid search RESULT for {mapping.smooth_name}: "
-            f"best_ratio={best_ratio:.4f}, "
-            f"initial_error={initial_error:.3e}, "
-            f"best_error={best_error:.3e}, "
-            f"reduction={err_reduction * 100:.3f}%, "
-            f"best_scales range=[{best_scales.min().item():.6f}, {best_scales.max().item():.6f}], "
-            f"best_scales mean={best_scales.mean().item():.6f}, std={best_scales.std().item():.6f}"
-        )
 
         # Store error metrics for this layer
         self._error_metrics.append(
