@@ -46,15 +46,11 @@ def _all_named_parameters(model: Module):
     for module_name, module in model.named_modules():
         for param_name, param in module._parameters.items():
             if param is not None:
-                full_name = (
-                    f"{module_name}.{param_name}" if module_name else param_name
-                )
+                full_name = f"{module_name}.{param_name}" if module_name else param_name
                 yield full_name, param
 
 
-def _detect_tied_weights(
-    model: Module, weight_map: dict[str, str]
-) -> dict[str, str]:
+def _detect_tied_weights(model: Module, weight_map: dict[str, str]) -> dict[str, str]:
     """
     Detect model parameters that are tied to other parameters but missing
     from the weight map. Returns ``{tied_name: source_name}`` where
@@ -257,14 +253,11 @@ def build_key_remapping(
 
     for sf_key, file_path in weight_map.items():
         if sf_key.startswith(prefix_to_strip):
-            model_key = prefix_to_add + sf_key[len(prefix_to_strip):]
+            model_key = prefix_to_add + sf_key[len(prefix_to_strip) :]
             if model_key in model_params:
                 remapped_weight_map[model_key] = file_path
                 model_to_safetensors[model_key] = sf_key
-            elif (
-                "." in model_key
-                and model_key.rsplit(".", 1)[0] in model_modules
-            ):
+            elif "." in model_key and model_key.rsplit(".", 1)[0] in model_modules:
                 # Fused weight: parent module exists but this specific weight
                 # is not a regular parameter (e.g., fused MoE expert tensors).
                 # Keep in remapped map so subgraph assignment works.
@@ -279,9 +272,7 @@ def build_key_remapping(
             passthrough_keys.append(sf_key)
 
     # Count fused vs param matches
-    fused_count = sum(
-        1 for k in remapped_weight_map if k not in model_params
-    )
+    fused_count = sum(1 for k in remapped_weight_map if k not in model_params)
     matched = len(remapped_weight_map)
     logger.info(
         f"Key remapping: {matched} matched ({matched - fused_count} params, "
@@ -383,9 +374,7 @@ def build_weight_map(model_path: str | os.PathLike) -> dict[str, str]:
 
     # Try to download just the index file (sharded model)
     try:
-        index_path = hf_hub_download(
-            model_path_str, "model.safetensors.index.json"
-        )
+        index_path = hf_hub_download(model_path_str, "model.safetensors.index.json")
         with open(index_path) as f:
             index = json.load(f)
 
@@ -509,7 +498,8 @@ def get_subgraph_weight_names(
             module_order.get(name, float("inf")) for name in target_names
         )
         return [
-            w for w in all_weight_names
+            w
+            for w in all_weight_names
             if not any(w.startswith(p) for p in target_prefixes)
             and module_order.get(w.rsplit(".", 1)[0] if "." in w else "", float("inf"))
             < first_target_order
@@ -526,9 +516,7 @@ def get_subgraph_weight_names(
         module_order = {
             name: idx for idx, (name, _) in enumerate(model.named_modules())
         }
-        last_target_order = max(
-            module_order.get(name, 0) for name in target_names
-        )
+        last_target_order = max(module_order.get(name, 0) for name in target_names)
         for w in all_weight_names:
             if any(w.startswith(p) for p in target_prefixes):
                 continue
@@ -688,9 +676,7 @@ def offload_subgraph_weights(
         # For unfused MoE experts, process all descendant modules
         modules_to_process = [module]
         if isinstance(module, torch.nn.ModuleList):
-            modules_to_process.extend(
-                m for m in module.modules() if m is not module
-            )
+            modules_to_process.extend(m for m in module.modules() if m is not module)
 
         for mod in modules_to_process:
             for attr_name in list(mod._parameters.keys()):
@@ -807,9 +793,7 @@ def _set_parameter(model: Module, param_name: str, tensor: torch.Tensor) -> None
         setattr(module, param_attr, tensor)
 
 
-def _try_set_fused_moe(
-    model: Module, param_name: str, tensor: torch.Tensor
-) -> bool:
+def _try_set_fused_moe(model: Module, param_name: str, tensor: torch.Tensor) -> bool:
     """
     Handle fused MoE expert tensors when the model has been unfused by
     MoE calibration modules (e.g., SequentialQwen3_5MoeExperts).
@@ -912,9 +896,7 @@ def _move_quantization_buffers(
         # own quantization buffers (e.g., "experts.0.gate_proj.weight_scale").
         modules_to_process = [module]
         if isinstance(module, torch.nn.ModuleList):
-            modules_to_process.extend(
-                m for m in module.modules() if m is not module
-            )
+            modules_to_process.extend(m for m in module.modules() if m is not module)
 
         for mod in modules_to_process:
             # Move all meta-device parameters and buffers on this module
@@ -966,14 +948,10 @@ def _move_quantization_buffers(
                                 moved_count += 1
 
     if moved_count > 0:
-        logger.debug(
-            f"Moved {moved_count} quantization buffers/params to {device}"
-        )
+        logger.debug(f"Moved {moved_count} quantization buffers/params to {device}")
 
 
-def _ensure_shard_available(
-    file_path: str, model_path: str | None = None
-) -> str:
+def _ensure_shard_available(file_path: str, model_path: str | None = None) -> str:
     """
     Ensure a safetensors shard file exists locally. If the file is missing
     (because we only downloaded the index, not all shards), download it
@@ -1164,7 +1142,7 @@ def compress_and_save_subgraph(
             module prefix ``model.layers.0.mlp.experts.0.gate_proj`` is not.
             """
             module_prefix = name.rsplit(".", 1)[0] if "." in name else ""
-            param_suffix = name[len(module_prefix) + 1:] if module_prefix else name
+            param_suffix = name[len(module_prefix) + 1 :] if module_prefix else name
 
             # Exact match
             if module_prefix in prefix_map:

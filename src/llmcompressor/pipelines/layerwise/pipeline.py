@@ -178,9 +178,15 @@ class LayerwisePipeline(CalibrationPipeline):
         # passthrough to avoid redundant copies.
         assigned_keys: set[str] = set()
         for si in range(num_subgraphs):
-            assigned_keys.update(get_subgraph_weight_names(
-                model, weight_map, sequential_targets, si, num_subgraphs,
-            ))
+            assigned_keys.update(
+                get_subgraph_weight_names(
+                    model,
+                    weight_map,
+                    sequential_targets,
+                    si,
+                    num_subgraphs,
+                )
+            )
 
         # Filter passthrough: keep original passthrough keys (VL visual/mtp)
         # that aren't assigned. Also add weight_map keys not assigned to any
@@ -272,8 +278,11 @@ class LayerwisePipeline(CalibrationPipeline):
             for subgraph_index, subgraph in enumerate(subgraphs):
                 # Determine which weights this subgraph needs
                 weight_names = get_subgraph_weight_names(
-                    model, weight_map, sequential_targets,
-                    subgraph_index, num_subgraphs,
+                    model,
+                    weight_map,
+                    sequential_targets,
+                    subgraph_index,
+                    num_subgraphs,
                 )
 
                 # Resume mode: replay forward pass to rebuild intermediates
@@ -281,31 +290,38 @@ class LayerwisePipeline(CalibrationPipeline):
                     prefetcher.wait()
                     if subgraph_index + 1 < num_subgraphs:
                         next_wn = get_subgraph_weight_names(
-                            model, weight_map, sequential_targets,
-                            subgraph_index + 1, num_subgraphs,
+                            model,
+                            weight_map,
+                            sequential_targets,
+                            subgraph_index + 1,
+                            num_subgraphs,
                         )
                         prefetcher.prefetch(next_wn, weight_map)
 
                     load_subgraph_weights(
-                        model, weight_names, weight_map, onload_device,
+                        model,
+                        weight_names,
+                        weight_map,
+                        onload_device,
                         model_path=model_path,
                         model_to_safetensors=model_to_safetensors,
                         tied_weights=tied_weights,
                     )
                     move_subgraph_buffers(
-                        model, subgraph.submodules(model, recurse=True),
+                        model,
+                        subgraph.submodules(model, recurse=True),
                         onload_device,
                     )
 
-                    replay_desc = (
-                        f"({subgraph_index + 1}/{num_subgraphs}): Replaying"
-                    )
+                    replay_desc = f"({subgraph_index + 1}/{num_subgraphs}): Replaying"
                     num_batches = len(dataloader)
                     with disable_offloading():
                         with HooksMixin.disable_hooks():
                             for batch_idx, inputs in _get_batches(
-                                activations, num_batches,
-                                subgraph.input_names, replay_desc,
+                                activations,
+                                num_batches,
+                                subgraph.input_names,
+                                replay_desc,
                                 sequential_prefetch,
                             ):
                                 output = subgraph.forward(model, **inputs)
@@ -328,8 +344,11 @@ class LayerwisePipeline(CalibrationPipeline):
                 # Start prefetching next subgraph's shards in background
                 if subgraph_index + 1 < num_subgraphs:
                     next_weight_names = get_subgraph_weight_names(
-                        model, weight_map, sequential_targets,
-                        subgraph_index + 1, num_subgraphs,
+                        model,
+                        weight_map,
+                        sequential_targets,
+                        subgraph_index + 1,
+                        num_subgraphs,
                     )
                     prefetcher.prefetch(next_weight_names, weight_map)
 
@@ -340,13 +359,17 @@ class LayerwisePipeline(CalibrationPipeline):
                     f"({len(weight_names)} parameters)"
                 )
                 load_subgraph_weights(
-                    model, weight_names, weight_map, onload_device,
+                    model,
+                    weight_names,
+                    weight_map,
+                    onload_device,
                     model_path=model_path,
                     model_to_safetensors=model_to_safetensors,
                     tied_weights=tied_weights,
                 )
                 move_subgraph_buffers(
-                    model, subgraph.submodules(model, recurse=True),
+                    model,
+                    subgraph.submodules(model, recurse=True),
                     onload_device,
                 )
 
@@ -395,8 +418,11 @@ class LayerwisePipeline(CalibrationPipeline):
                 # Compress-as-you-go: compress, save to shard, and free memory
                 if output_dir is not None:
                     saved_size = compress_and_save_subgraph(
-                        model, weight_names, output_dir,
-                        subgraph_index, shard_weight_map,
+                        model,
+                        weight_names,
+                        output_dir,
+                        subgraph_index,
+                        shard_weight_map,
                         model_to_safetensors=model_to_safetensors,
                         tied_weights=tied_weights,
                     )
@@ -417,8 +443,10 @@ class LayerwisePipeline(CalibrationPipeline):
                 # Copy passthrough weights (visual encoder, mtp, etc.)
                 if raw_passthrough_keys:
                     pt_size = copy_passthrough_weights(
-                        raw_passthrough_keys, raw_weight_map,
-                        output_dir, shard_weight_map,
+                        raw_passthrough_keys,
+                        raw_weight_map,
+                        output_dir,
+                        shard_weight_map,
                         model_path=model_path,
                     )
                     total_saved_size += pt_size

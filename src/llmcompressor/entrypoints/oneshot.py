@@ -219,12 +219,9 @@ class Oneshot:
             output_dir = self.output_dir
             if (
                 self.recipe_args is not None
-                and getattr(self.recipe_args, "stage", None)
-                is not None
+                and getattr(self.recipe_args, "stage", None) is not None
             ):
-                output_dir = os.path.join(
-                    output_dir, self.recipe_args.stage
-                )
+                output_dir = os.path.join(output_dir, self.recipe_args.stage)
 
             # Save model config with quantization metadata.
             # For VL/multimodal models, the CausalLM model's config is the
@@ -241,9 +238,7 @@ class Oneshot:
                 self.model.config.save_pretrained(output_dir)
 
             # Update config with compression info
-            compressor = ModelCompressor.from_pretrained_model(
-                self.model
-            )
+            compressor = ModelCompressor.from_pretrained_model(self.model)
             compressor.update_config(output_dir)
 
             # Add passthrough module names to quantization config ignore
@@ -302,14 +297,10 @@ class Oneshot:
                     shutil.copy2(src, dst)
 
             # Save recipe
-            update_and_save_recipe(
-                self.model.name_or_path, output_dir
-            )
+            update_and_save_recipe(self.model.name_or_path, output_dir)
             copy_python_files_from_model_cache(self.model, output_dir)
 
-            logger.info(
-                f"Layerwise compress-as-you-go: saved to {output_dir}"
-            )
+            logger.info(f"Layerwise compress-as-you-go: saved to {output_dir}")
         else:
             # Legacy path: wrap save_pretrained for compressed saving
             if getattr(self.model_args, "layerwise", False):
@@ -360,10 +351,7 @@ class Oneshot:
 
             user_pipeline = self.dataset_args.pipeline
             # Auto-select layerwise pipeline when model is on meta device
-            if (
-                hasattr(self.model, "device")
-                and self.model.device.type == "meta"
-            ):
+            if hasattr(self.model, "device") and self.model.device.type == "meta":
                 user_pipeline = "layerwise"
             pipeline = CalibrationPipeline.from_modifiers(
                 session.lifecycle.recipe.modifiers, user=user_pipeline

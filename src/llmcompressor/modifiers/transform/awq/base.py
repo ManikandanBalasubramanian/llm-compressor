@@ -542,9 +542,7 @@ class AWQModifier(Modifier):
                 # Optimization: check available VRAM first — if enough headroom,
                 # keep on GPU to avoid repeated CPU↔GPU transfers during grid
                 # search (n_grid × n_batches transfers otherwise).
-                is_layerwise = (
-                    active_session().state.pipeline_type == "layerwise"
-                )
+                is_layerwise = active_session().state.pipeline_type == "layerwise"
                 if is_layerwise:
                     fp16_bytes = sum(t.nbytes for t in fp16_outputs)
                     try:
@@ -792,9 +790,7 @@ class AWQModifier(Modifier):
                     ).to(balance_layer.weight.dtype)
 
                 # W_q * X (streaming loss computation — no bulk output storage)
-                is_layerwise = (
-                    active_session().state.pipeline_type == "layerwise"
-                )
+                is_layerwise = active_session().state.pipeline_type == "layerwise"
                 if is_layerwise:
                     loss = self._run_samples_and_compute_loss(
                         mapping.parent, fp16_outputs
