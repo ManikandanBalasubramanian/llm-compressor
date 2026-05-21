@@ -554,11 +554,34 @@ class AWQModifier(Modifier):
                 # Move fp16 reference outputs to CPU to free GPU memory
                 # during grid search (only for layerwise quantization where
                 # GPU memory is constrained by sequential onloading).
+                # Optimization: check available VRAM first — if enough headroom,
+                # keep on GPU to avoid repeated CPU↔GPU transfers during grid
+                # search (n_grid × n_batches transfers otherwise).
                 is_layerwise = (
                     active_session().state.pipeline_type == "layerwise"
                 )
                 if is_layerwise:
-                    fp16_outputs = [t.cpu() for t in fp16_outputs]
+                    fp16_bytes = sum(t.nbytes for t in fp16_outputs)
+                    try:
+                        device = get_execution_device(parent_module)
+                        free_vram, _ = torch.cuda.mem_get_info(device)
+                        # Keep on GPU if fp16_outputs fit within 50% of free VRAM
+                        if fp16_bytes < free_vram * 0.5:
+                            logger.debug(
+                                f"[AWQ-OPT] Keeping fp16_outputs on GPU "
+                                f"({fp16_bytes / 1e6:.1f} MB, "
+                                f"{free_vram / 1e6:.1f} MB free)"
+                            )
+                        else:
+                            logger.debug(
+                                f"[AWQ-OPT] Offloading fp16_outputs to CPU "
+                                f"({fp16_bytes / 1e6:.1f} MB, "
+                                f"{free_vram / 1e6:.1f} MB free)"
+                            )
+                            fp16_outputs = [t.cpu() for t in fp16_outputs]
+                    except Exception:
+                        # Fallback: offload to be safe
+                        fp16_outputs = [t.cpu() for t in fp16_outputs]
 
                 orig_layer_weights = {
                     balance_layer: balance_layer.weight.clone()
@@ -689,7 +712,9 @@ class AWQModifier(Modifier):
             output = module(**batch_kwargs)
             int_w_batch = output[0] if isinstance(output, tuple) else output
 
-            fp16_batch = fp16_outputs[batch_idx].to(device)
+            fp16_batch = fp16_outputs[batch_idx]
+            if fp16_batch.device != device:
+                fp16_batch = fp16_batch.to(device)
 
             loss_mask = loss_masks[batch_idx] if loss_masks else None
             if loss_mask is not None:
@@ -784,6 +809,25 @@ class AWQModifier(Modifier):
             ],
         ):
             fuse_weight_observers(mapping.parent)
+
+            # Pre-move fp16_outputs to GPU before grid search to avoid
+            # repeated CPU→GPU transfers (n_grid × n_batches otherwise).
+            # Only do this when outputs are on CPU and there's enough VRAM.
+            _fp16_premoved = False
+            if fp16_outputs and fp16_outputs[0].device.type == "cpu":
+                fp16_bytes = sum(t.nbytes for t in fp16_outputs)
+                try:
+                    free_vram, _ = torch.cuda.mem_get_info(device)
+                    if fp16_bytes < free_vram * 0.4:
+                        fp16_outputs = [t.to(device) for t in fp16_outputs]
+                        _fp16_premoved = True
+                        logger.debug(
+                            f"[AWQ-OPT] Pre-moved fp16_outputs to GPU for "
+                            f"grid search ({fp16_bytes / 1e6:.1f} MB)"
+                        )
+                except Exception:
+                    pass
+
             pbar = tqdm(
                 self._get_grid_search_params(),
                 desc=f"Grid search for {mapping.smooth_name}",
@@ -852,6 +896,12 @@ class AWQModifier(Modifier):
                     best_ratio = ratio
                     best_scales = scales.clone()
                 pbar.set_postfix({"best_error": f"{best_error:.3e}"})
+
+        # Free pre-moved fp16_outputs from GPU after grid search
+        if _fp16_premoved:
+            fp16_outputs = [t.cpu() for t in fp16_outputs]
+            del fp16_outputs
+            torch.cuda.empty_cache()
 
         if best_ratio == -1:
             logger.debug(history)

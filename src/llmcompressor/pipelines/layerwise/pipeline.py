@@ -394,21 +394,6 @@ class LayerwisePipeline(CalibrationPipeline):
 
                 # Compress-as-you-go: compress, save to shard, and free memory
                 if output_dir is not None:
-                    # DEBUG: Check if AWQ smoothing persisted
-                    if subgraph_index <= 2:
-                        for wn in weight_names:
-                            if 'input_layernorm' in wn or 'post_attention_layernorm' in wn:
-                                parts = wn.split('.')
-                                mod = model
-                                for p in parts[:-1]:
-                                    mod = getattr(mod, p)
-                                param = getattr(mod, parts[-1])
-                                if param.device.type != 'meta':
-                                    logger.info(
-                                        f"[SAVE-CHECK] {wn}: device={param.device}, "
-                                        f"mean={param.float().mean():.6f}, "
-                                        f"first3={param[:3].tolist()}"
-                                    )
                     saved_size = compress_and_save_subgraph(
                         model, weight_names, output_dir,
                         subgraph_index, shard_weight_map,
